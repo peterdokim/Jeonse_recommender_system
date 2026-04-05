@@ -6,9 +6,13 @@ from common.queries import load_all_area_history, load_grade_summary, load_score
 from common.recommendation import (
     DIMENSION_LABELS,
     GRADE_MEANINGS,
+    SEARCH_SCOPE_OPTIONS,
+    SURVEY_QUESTIONS,
     build_candidate_summary,
+    build_profile_summary,
     build_recommendation_dataset,
     build_recommendation_reasons,
+    classify_survey_profile,
     format_currency_krw,
     from_eok,
     get_area_history,
@@ -28,6 +32,14 @@ def init_state() -> None:
         st.session_state["deposit_amount"] = 500_000_000
     if "deposit_slider_eok" not in st.session_state:
         st.session_state["deposit_slider_eok"] = to_eok(st.session_state["deposit_amount"])
+    if "survey_completed" not in st.session_state:
+        st.session_state["survey_completed"] = False
+    for question in SURVEY_QUESTIONS:
+        if question["key"] not in st.session_state:
+            st.session_state[question["key"]] = 3
+        landing_key = f"landing_{question['key']}"
+        if landing_key not in st.session_state:
+            st.session_state[landing_key] = st.session_state[question["key"]]
 
 
 def sync_deposit_from_slider() -> None:
@@ -36,6 +48,38 @@ def sync_deposit_from_slider() -> None:
 
 def sync_slider_from_input() -> None:
     st.session_state["deposit_slider_eok"] = to_eok(st.session_state["deposit_amount"])
+
+
+def get_survey_answers() -> dict[str, int]:
+    return {question["key"]: int(st.session_state[question["key"]]) for question in SURVEY_QUESTIONS}
+
+
+def render_initial_survey() -> None:
+    st.subheader("위험 성향 설문")
+    st.write("처음 한 번만 간단한 설문에 답하면, 그 결과를 바탕으로 추천 가중치를 개인화합니다.")
+
+    with st.form("risk_profile_survey"):
+        for question in SURVEY_QUESTIONS:
+            st.select_slider(
+                question["label"],
+                options=[1, 2, 3, 4, 5],
+                key=f"landing_{question['key']}",
+            )
+        submitted = st.form_submit_button("설문 완료하고 추천 보기", type="primary")
+
+    st.caption("1은 전혀 아니다, 5는 매우 그렇다")
+
+    if submitted:
+        for question in SURVEY_QUESTIONS:
+            st.session_state[question["key"]] = int(st.session_state[f"landing_{question['key']}"])
+        st.session_state["survey_completed"] = True
+        st.rerun()
+
+
+def reset_survey() -> None:
+    st.session_state["survey_completed"] = False
+    for question in SURVEY_QUESTIONS:
+        st.session_state[f"landing_{question['key']}"] = st.session_state[question["key"]]
 
 
 def inject_styles() -> None:
@@ -47,7 +91,6 @@ def inject_styles() -> None:
             --soft: #f4f8f5;
             --line: #d8e5dc;
             --accent: #2d7a52;
-            --warn: #f57c00;
             --card: #ffffff;
         }
         .block-container {
@@ -141,14 +184,15 @@ def make_history_chart(history_df: pd.DataFrame) -> alt.Chart:
 def build_comparison_table(candidate_row: pd.Series, alternative_row: pd.Series) -> pd.DataFrame:
     return pd.DataFrame(
         [
-            ("추천 점수", f"{candidate_row['RECOMMENDATION_SCORE']:.1f}", f"{alternative_row['RECOMMENDATION_SCORE']:.1f}", f"{alternative_row['VS_CANDIDATE_DELTA']:+.1f}"),
-            ("구조 기반 안전 점수", f"{candidate_row['TOTAL_SCORE']:.1f}", f"{alternative_row['TOTAL_SCORE']:.1f}", f"{alternative_row['TOTAL_SCORE'] - candidate_row['TOTAL_SCORE']:+.1f}"),
-            ("백테스트 점수", f"{candidate_row['BACKTEST_SCORE']:.1f}", f"{alternative_row['BACKTEST_SCORE']:.1f}", f"{alternative_row['BACKTEST_SCORE'] - candidate_row['BACKTEST_SCORE']:+.1f}"),
+            ("공통 안전점수", f"{candidate_row['SAFETY_SCORE']:.1f}", f"{alternative_row['SAFETY_SCORE']:.1f}", f"{alternative_row['SAFETY_SCORE'] - candidate_row['SAFETY_SCORE']:+.1f}"),
+            ("손실 패널티", f"{candidate_row['LOSS_PENALTY_SCORE']:.1f}", f"{alternative_row['LOSS_PENALTY_SCORE']:.1f}", f"{alternative_row['LOSS_PENALTY_SCORE'] - candidate_row['LOSS_PENALTY_SCORE']:+.1f}"),
+            ("가격 과열 패널티", f"{candidate_row['PRICE_OVERHEAT_PENALTY_SCORE']:.1f}", f"{alternative_row['PRICE_OVERHEAT_PENALTY_SCORE']:.1f}", f"{alternative_row['PRICE_OVERHEAT_PENALTY_SCORE'] - candidate_row['PRICE_OVERHEAT_PENALTY_SCORE']:+.1f}"),
+            ("선호 적합도", f"{candidate_row['PREFERENCE_FIT_SCORE']:.1f}", f"{alternative_row['PREFERENCE_FIT_SCORE']:.1f}", f"{alternative_row['PREFERENCE_FIT_SCORE'] - candidate_row['PREFERENCE_FIT_SCORE']:+.1f}"),
+            ("현재 후보 유사도", f"{candidate_row['SIMILARITY_SCORE']:.1f}", f"{alternative_row['SIMILARITY_SCORE']:.1f}", f"{alternative_row['SIMILARITY_SCORE'] - candidate_row['SIMILARITY_SCORE']:+.1f}"),
+            ("최종 추천점수", f"{candidate_row['RECOMMENDATION_SCORE']:.1f}", f"{alternative_row['RECOMMENDATION_SCORE']:.1f}", f"{alternative_row['VS_CANDIDATE_DELTA']:+.1f}"),
             ("예상 손실 노출", format_currency_krw(candidate_row["LOSS_EXPOSURE_AMOUNT"]), format_currency_krw(alternative_row["LOSS_EXPOSURE_AMOUNT"]), format_currency_krw(candidate_row["LOSS_EXPOSURE_AMOUNT"] - alternative_row["LOSS_EXPOSURE_AMOUNT"])),
-            ("전세 추정 총액", format_currency_krw(candidate_row["ESTIMATED_TOTAL_JEONSE"]), format_currency_krw(alternative_row["ESTIMATED_TOTAL_JEONSE"]), format_currency_krw(alternative_row["ESTIMATED_TOTAL_JEONSE"] - candidate_row["ESTIMATED_TOTAL_JEONSE"])),
-            ("전세가율", f"{candidate_row['JEONSE_RATE']:.1f}%", f"{alternative_row['JEONSE_RATE']:.1f}%", f"{alternative_row['JEONSE_RATE'] - candidate_row['JEONSE_RATE']:+.1f}%p"),
         ],
-        columns=["지표", "현재 후보", "추천 대안", "차이"],
+        columns=["항목", "현재 후보", "추천 대안", "차이"],
     )
 
 
@@ -173,17 +217,18 @@ st.markdown(
         <div class="hero-kicker">Jeonse Safety Recommender</div>
         <div class="hero-title">전세 안심 추천</div>
         <div class="hero-sub">
-            현재 보고 있는 후보보다, 같은 예산과 생활 조건 안에서 더 안전한 전세 대안을 찾기 위한 개인화 추천 MVP입니다.
+            설문으로 위험 성향을 분류한 뒤, 공통 안전점수는 유지하고 손실 패널티와 선호 적합도만 다르게 반영하는 개인화 추천 흐름입니다.
         </div>
     </div>
     """,
     unsafe_allow_html=True,
 )
 
-st.caption(
-    "현재 버전은 Snowflake 내부 구조 데이터와 시계열을 사용합니다. "
-    "MOLIT 실거래가 API는 가격 기준선과 설명력을 더 강화할 수 있도록 이후 단계에 연결할 수 있게 구조를 분리했습니다."
-)
+st.caption("설문 → 성향 분류 → 공통 안전점수 유지 → 성향별 re-ranking → 결과 설명")
+
+if not st.session_state["survey_completed"]:
+    render_initial_survey()
+    st.stop()
 
 st.sidebar.title("추천 조건")
 selected_sgg = st.sidebar.selectbox("현재 관심 구", sgg_options)
@@ -191,10 +236,9 @@ emd_options = sorted(scores_df.loc[scores_df["SGG"] == selected_sgg, "EMD"].drop
 selected_emd = st.sidebar.selectbox("현재 관심 동", emd_options)
 st.sidebar.slider(
     "보증금 슬라이더 (억원)",
-    0.0,
-    20.0,
-    st.session_state["deposit_slider_eok"],
-    0.5,
+    min_value=0.0,
+    max_value=20.0,
+    step=0.5,
     key="deposit_slider_eok",
     on_change=sync_deposit_from_slider,
 )
@@ -206,10 +250,14 @@ st.sidebar.number_input(
     on_change=sync_slider_from_input,
 )
 workplace_sgg = st.sidebar.selectbox("주요 생활권 / 출근 구", sgg_options, index=min(1, len(sgg_options) - 1))
-risk_profile = st.sidebar.selectbox("위험 성향", ["보수형", "균형형", "유연형"], index=1)
 preferred_pyeong = st.sidebar.slider("희망 평형 (평)", 10, 40, 24, 1)
-search_scope = st.sidebar.selectbox("탐색 범위", ["현재 관심 구 우선", "출퇴근권 우선", "전체 후보"], index=1)
+search_scope = st.sidebar.selectbox("탐색 범위", SEARCH_SCOPE_OPTIONS, index=1)
 budget_tolerance_pct = st.sidebar.slider("예산 허용 범위 (±%)", 5, 20, 10, 1)
+
+survey_answers = get_survey_answers()
+survey_result = classify_survey_profile(survey_answers)
+st.sidebar.markdown(f"### 현재 성향: {survey_result['profile']}")
+st.sidebar.caption(survey_result["description"])
 
 deposit_amount = st.session_state["deposit_amount"]
 selected_area = f"{selected_sgg} {selected_emd}"
@@ -219,7 +267,7 @@ recommendation_df = build_recommendation_dataset(
     history_df=all_area_history_df,
     deposit_amount=deposit_amount,
     workplace_sgg=workplace_sgg,
-    risk_profile=risk_profile,
+    survey_result=survey_result,
     preferred_pyeong=preferred_pyeong,
     candidate_area=selected_area,
     search_scope=search_scope,
@@ -232,14 +280,19 @@ better_df = recommendation_df[recommendation_df["BETTER_ALTERNATIVE"]].copy()
 best_alternative = better_df.iloc[0] if not better_df.empty else None
 selected_history_df = get_area_history(all_area_history_df, candidate_row["SGG"], candidate_row["EMD"])
 
+action_left, action_right = st.columns([1, 4])
+with action_left:
+    if st.button("위험 성향 설문 다시 하기", use_container_width=True):
+        reset_survey()
+        st.rerun()
+with action_right:
+    st.info(build_profile_summary(survey_result))
+
 hero_1, hero_2, hero_3, hero_4 = st.columns(4)
-hero_1.metric("분석 후보 수", len(recommendation_df))
+hero_1.metric("분류 성향", survey_result["profile"])
 hero_2.metric("현재 후보 순위", f"{int(candidate_row['RECOMMENDATION_RANK'])}위")
 hero_3.metric("조건 충족 대안", len(filtered_df) - 1 if len(filtered_df) > 0 else 0)
-hero_4.metric(
-    "현재 후보 예상 손실",
-    format_currency_krw(candidate_row["LOSS_EXPOSURE_AMOUNT"]),
-)
+hero_4.metric("현재 후보 예상 손실", format_currency_krw(candidate_row["LOSS_EXPOSURE_AMOUNT"]))
 
 summary_left, summary_right = st.columns(2)
 with summary_left:
@@ -250,8 +303,8 @@ with summary_left:
             <div class="summary-value">{selected_area}</div>
             <div class="summary-body">
                 <span class="pill">등급 {candidate_row['GRADE']} · {GRADE_MEANINGS[candidate_row['GRADE']]}</span><br/><br/>
-                추천 점수 {candidate_row['RECOMMENDATION_SCORE']:.1f}점<br/>
-                구조 점수 {candidate_row['TOTAL_SCORE']:.1f}점<br/>
+                공통 안전점수 {candidate_row['SAFETY_SCORE']:.1f}점<br/>
+                최종 추천점수 {candidate_row['RECOMMENDATION_SCORE']:.1f}점<br/>
                 추정 전세 총액 {format_currency_krw(candidate_row['ESTIMATED_TOTAL_JEONSE'])}<br/>
                 예상 손실 노출 {format_currency_krw(candidate_row['LOSS_EXPOSURE_AMOUNT'])}
             </div>
@@ -263,13 +316,13 @@ with summary_left:
 with summary_right:
     if best_alternative is None:
         st.markdown(
-            """
+            f"""
             <div class="summary-card">
-                <div class="summary-title">추천 결과</div>
-                <div class="summary-value">현재 후보가 상위권입니다</div>
+                <div class="summary-title">성향 반영 결과</div>
+                <div class="summary-value">{survey_result['profile']} 기준 현재 후보 유지</div>
                 <div class="summary-body">
-                    현재 입력한 조건에서는 현재 후보보다 손실 노출이 낮고 추천 점수가 더 높은 대안이 보이지 않습니다.
-                    범위를 넓히거나 위험 성향을 바꿔서 다시 탐색해 보세요.
+                    현재 입력 조건에서는 현재 후보보다 손실 노출이 낮고 최종 추천점수가 더 높은 대안이 보이지 않습니다.<br/>
+                    {survey_result['description']}
                 </div>
             </div>
             """,
@@ -282,10 +335,10 @@ with summary_right:
                 <div class="summary-title">가장 유력한 대안</div>
                 <div class="summary-value">{best_alternative['AREA_LABEL']}</div>
                 <div class="summary-body">
-                    <span class="pill">추천 점수 +{best_alternative['VS_CANDIDATE_DELTA']:.1f}</span><br/><br/>
-                    구조 점수 {best_alternative['TOTAL_SCORE']:.1f}점<br/>
+                    <span class="pill">최종 추천점수 +{best_alternative['VS_CANDIDATE_DELTA']:.1f}</span><br/><br/>
+                    공통 안전점수 {best_alternative['SAFETY_SCORE']:.1f}점<br/>
                     예상 손실 노출 {format_currency_krw(best_alternative['LOSS_EXPOSURE_AMOUNT'])}<br/>
-                    전세 추정 총액 {format_currency_krw(best_alternative['ESTIMATED_TOTAL_JEONSE'])}
+                    선호 적합도 {best_alternative['PREFERENCE_FIT_SCORE']:.1f}점
                 </div>
             </div>
             """,
@@ -295,29 +348,40 @@ with summary_right:
 tabs = st.tabs(["개인화 추천", "후보 진단", "비교 분석", "시장 흐름"])
 
 with tabs[0]:
-    st.subheader("현재 후보보다 더 안전한 대안")
+    st.subheader("설문 성향을 반영한 추천 결과")
+    survey_table = pd.DataFrame(
+        [
+            ("안전 선호 점수", f"{survey_result['safety_preference']:.1f}"),
+            ("편의 선호 점수", f"{survey_result['convenience_preference']:.1f}"),
+            ("유사성 선호 점수", f"{survey_result['similarity_preference']:.1f}"),
+            ("위험 허용도", f"{survey_result['risk_tolerance']:.1f}"),
+            ("적용 계수", f"α={candidate_row['ALPHA']:.1f}, β={candidate_row['BETA']:.1f}, γ={candidate_row['GAMMA']:.1f}, δ={candidate_row['DELTA']:.1f}"),
+        ],
+        columns=["항목", "값"],
+    )
+    st.dataframe(survey_table, use_container_width=True, hide_index=True)
 
     if best_alternative is None:
         st.success("현재 입력 조건에서는 현재 후보가 이미 상위권으로 보입니다.")
     else:
         st.info(
-            f"{best_alternative['AREA_LABEL']}은(는) 현재 후보보다 추천 점수가 {best_alternative['VS_CANDIDATE_DELTA']:.1f}점 높고, "
+            f"{best_alternative['AREA_LABEL']}은(는) 현재 후보보다 최종 추천점수가 {best_alternative['VS_CANDIDATE_DELTA']:.1f}점 높고, "
             f"예상 손실 노출은 {format_currency_krw(candidate_row['LOSS_EXPOSURE_AMOUNT'] - best_alternative['LOSS_EXPOSURE_AMOUNT'])} 낮습니다."
         )
-        for reason in build_recommendation_reasons(best_alternative, candidate_row):
+        for reason in build_recommendation_reasons(best_alternative, candidate_row, survey_result):
             st.markdown(f"- {reason}")
 
     top_chart_df = filtered_df.head(8).copy()
     if not top_chart_df.empty:
         chart = alt.Chart(top_chart_df).mark_bar(cornerRadiusEnd=8).encode(
-            x=alt.X("RECOMMENDATION_SCORE:Q", title="추천 점수", scale=alt.Scale(domain=[0, 100])),
+            x=alt.X("RECOMMENDATION_SCORE:Q", title="최종 추천점수", scale=alt.Scale(domain=[0, 100])),
             y=alt.Y("AREA_LABEL:N", sort="-x", title="동네"),
             color=alt.condition(alt.datum.IS_CANDIDATE, alt.value("#ef6c00"), alt.value("#2d7a52")),
             tooltip=[
                 "AREA_LABEL",
                 alt.Tooltip("RECOMMENDATION_SCORE:Q", format=".1f"),
+                alt.Tooltip("SAFETY_SCORE:Q", format=".1f"),
                 alt.Tooltip("LOSS_EXPOSURE_AMOUNT:Q", format=",.0f"),
-                alt.Tooltip("ESTIMATED_TOTAL_JEONSE:Q", format=",.0f"),
             ],
         )
         st.altair_chart(chart, use_container_width=True)
@@ -327,11 +391,12 @@ with tabs[0]:
             "RECOMMENDATION_RANK",
             "AREA_LABEL",
             "RECOMMENDATION_SCORE",
-            "TOTAL_SCORE",
-            "BACKTEST_SCORE",
+            "SAFETY_SCORE",
+            "LOSS_PENALTY_SCORE",
+            "PRICE_OVERHEAT_PENALTY_SCORE",
+            "PREFERENCE_FIT_SCORE",
+            "SIMILARITY_SCORE",
             "LOSS_EXPOSURE_AMOUNT",
-            "ESTIMATED_TOTAL_JEONSE",
-            "COMMUTE_FIT_SCORE",
             "VS_CANDIDATE_DELTA",
         ]
     ].head(10).copy()
@@ -339,30 +404,26 @@ with tabs[0]:
         columns={
             "RECOMMENDATION_RANK": "순위",
             "AREA_LABEL": "동네",
-            "RECOMMENDATION_SCORE": "추천 점수",
-            "TOTAL_SCORE": "구조 점수",
-            "BACKTEST_SCORE": "백테스트",
-            "LOSS_EXPOSURE_AMOUNT": "손실 노출",
-            "ESTIMATED_TOTAL_JEONSE": "전세 추정 총액",
-            "COMMUTE_FIT_SCORE": "출퇴근 적합도",
+            "RECOMMENDATION_SCORE": "최종 추천점수",
+            "SAFETY_SCORE": "공통 안전점수",
+            "LOSS_PENALTY_SCORE": "손실 패널티",
+            "PRICE_OVERHEAT_PENALTY_SCORE": "가격 과열 패널티",
+            "PREFERENCE_FIT_SCORE": "선호 적합도",
+            "SIMILARITY_SCORE": "현재 후보 유사도",
+            "LOSS_EXPOSURE_AMOUNT": "예상 손실 노출",
             "VS_CANDIDATE_DELTA": "후보 대비",
         }
     )
-    recommendation_table["손실 노출"] = recommendation_table["손실 노출"].map(format_currency_krw)
-    recommendation_table["전세 추정 총액"] = recommendation_table["전세 추정 총액"].map(format_currency_krw)
+    recommendation_table["예상 손실 노출"] = recommendation_table["예상 손실 노출"].map(format_currency_krw)
     st.dataframe(recommendation_table, use_container_width=True, hide_index=True)
-
-    st.caption(
-        f"Hard Filter: 보증금 ±{budget_tolerance_pct}% · {search_scope} · 희망 평형 {preferred_pyeong}평 기준 추정"
-    )
 
 with tabs[1]:
     st.subheader("현재 후보 진단")
     diag_1, diag_2, diag_3, diag_4 = st.columns(4)
     diag_1.metric("등급", f"{candidate_row['GRADE']} · {GRADE_MEANINGS[candidate_row['GRADE']]}")
-    diag_2.metric("구조 기반 안전 점수", f"{candidate_row['TOTAL_SCORE']:.1f}")
+    diag_2.metric("공통 안전점수", f"{candidate_row['SAFETY_SCORE']:.1f}")
     diag_3.metric("전세가율", f"{candidate_row['JEONSE_RATE']:.1f}%")
-    diag_4.metric("백테스트 점수", f"{candidate_row['BACKTEST_SCORE']:.1f}")
+    diag_4.metric("최종 추천점수", f"{candidate_row['RECOMMENDATION_SCORE']:.1f}")
 
     dim_df = pd.DataFrame(
         {
@@ -383,21 +444,20 @@ with tabs[1]:
         )
     with right:
         st.markdown("#### 해석 요약")
-        st.write(build_candidate_summary(candidate_row))
-        st.markdown("#### 개인화 신호")
+        st.write(build_candidate_summary(candidate_row, survey_result))
+        st.markdown("#### 개인화 재정렬 요소")
         st.dataframe(
             pd.DataFrame(
                 [
+                    ("손실 패널티", f"{candidate_row['LOSS_PENALTY_SCORE']:.1f}"),
+                    ("가격 과열 패널티", f"{candidate_row['PRICE_OVERHEAT_PENALTY_SCORE']:.1f}"),
+                    ("선호 적합도", f"{candidate_row['PREFERENCE_FIT_SCORE']:.1f}"),
+                    ("현재 후보 유사도", f"{candidate_row['SIMILARITY_SCORE']:.1f}"),
+                    ("백테스트 점수", f"{candidate_row['BACKTEST_SCORE']:.1f}"),
                     ("예상 손실 노출", format_currency_krw(candidate_row["LOSS_EXPOSURE_AMOUNT"])),
-                    ("전세 추정 총액", format_currency_krw(candidate_row["ESTIMATED_TOTAL_JEONSE"])),
-                    ("가격 맥락 점수", f"{candidate_row['PRICE_CONTEXT_SCORE']:.1f}"),
-                    ("예산 적합도", f"{candidate_row['BUDGET_FIT_SCORE']:.1f}"),
-                    ("출퇴근 적합도", f"{candidate_row['COMMUTE_FIT_SCORE']:.1f}"),
-                    ("생활권 적합도", f"{candidate_row['LIFESTYLE_FIT_SCORE']:.1f}"),
-                    ("12개월 회복률", f"{candidate_row['BT_RECOVERY_RATE']:.1f}%"),
-                    ("하방 히트율", f"{candidate_row['BT_DOWNSIDE_HIT_RATE']:.1f}%"),
+                    ("추정 전세 총액", format_currency_krw(candidate_row["ESTIMATED_TOTAL_JEONSE"])),
                 ],
-                columns=["지표", "값"],
+                columns=["항목", "값"],
             ),
             use_container_width=True,
             hide_index=True,
@@ -465,32 +525,31 @@ with tabs[2]:
             [
                 "AREA_LABEL",
                 "RECOMMENDATION_SCORE",
-                "TOTAL_SCORE",
-                "BACKTEST_SCORE",
+                "SAFETY_SCORE",
+                "LOSS_PENALTY_SCORE",
+                "PREFERENCE_FIT_SCORE",
+                "SIMILARITY_SCORE",
                 "LOSS_EXPOSURE_AMOUNT",
-                "ESTIMATED_TOTAL_JEONSE",
                 "JEONSE_RATE",
-                "COMMUTE_FIT_SCORE",
             ]
         ].rename(
             columns={
                 "AREA_LABEL": "동네",
-                "RECOMMENDATION_SCORE": "추천 점수",
-                "TOTAL_SCORE": "구조 점수",
-                "BACKTEST_SCORE": "백테스트",
-                "LOSS_EXPOSURE_AMOUNT": "손실 노출",
-                "ESTIMATED_TOTAL_JEONSE": "전세 추정 총액",
+                "RECOMMENDATION_SCORE": "최종 추천점수",
+                "SAFETY_SCORE": "공통 안전점수",
+                "LOSS_PENALTY_SCORE": "손실 패널티",
+                "PREFERENCE_FIT_SCORE": "선호 적합도",
+                "SIMILARITY_SCORE": "현재 후보 유사도",
+                "LOSS_EXPOSURE_AMOUNT": "예상 손실 노출",
                 "JEONSE_RATE": "전세가율",
-                "COMMUTE_FIT_SCORE": "출퇴근 적합도",
             }
         )
-        compare_table["손실 노출"] = compare_table["손실 노출"].map(format_currency_krw)
-        compare_table["전세 추정 총액"] = compare_table["전세 추정 총액"].map(format_currency_krw)
+        compare_table["예상 손실 노출"] = compare_table["예상 손실 노출"].map(format_currency_krw)
         compare_table["전세가율"] = compare_table["전세가율"].map(lambda value: f"{value:.1f}%")
         st.dataframe(compare_table, use_container_width=True, hide_index=True)
 
 with tabs[3]:
-    st.subheader("시장 흐름과 구현 구조")
+    st.subheader("시장 흐름과 추천 파이프라인")
     market_left, market_right = st.columns([1.2, 0.8])
 
     with market_left:
@@ -504,7 +563,7 @@ with tabs[3]:
             pd.DataFrame(
                 [
                     ("현재 후보", selected_area),
-                    ("위험 성향", risk_profile),
+                    ("분류 성향", survey_result["profile"]),
                     ("탐색 범위", search_scope),
                     ("예산 허용 범위", f"±{budget_tolerance_pct}%"),
                     ("주요 생활권", workplace_sgg),
@@ -519,10 +578,10 @@ with tabs[3]:
     st.markdown("#### 추천 파이프라인")
     pipeline_df = pd.DataFrame(
         [
-            ("Hard Filter", "보증금 밴드, 탐색 범위", "현재 후보와 비교 가능한 대안군 축소"),
-            ("Safety Ranking", "구조 점수, 백테스트, 손실 노출, 가격 맥락", "보증금 회수 위험이 더 낮은 후보 우선"),
-            ("Preference Re-ranking", "출퇴근, 생활권, 후보 유사성", "안전성은 유지하면서 실제 거주 가능성 반영"),
-            ("MOLIT 연동 준비", "실거래가 API 테이블 추가 예정", "매매/전월세 기준선과 과열 판정 정교화"),
+            ("설문", "6개 문항 응답", "안전 선호, 편의 선호, 유사성 선호 점수 계산"),
+            ("성향 분류", "보수형 / 중도위험형 / 모험형", "설문 결과를 성향으로 맵핑"),
+            ("공통 안전점수", "전세가율 50 + 전입전출 25 + 지하철 25", "모든 사용자에게 동일한 객관 레이어"),
+            ("성향 반영 re-ranking", "추천점수 = 안전점수 - α손실패널티 - β가격과열패널티 + γ선호적합도 + δ유사도", "성향별 계수만 다르게 적용"),
         ],
         columns=["단계", "현재 반영", "역할"],
     )

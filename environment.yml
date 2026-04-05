@@ -2,8 +2,7 @@ name: jeonse-safety-app
 channels:
   - snowflake
 dependencies:
-  - python=3.11
-  - streamlit
+  - streamlit=1.50.0
   - snowflake-snowpark-python
   - pandas
   - altair

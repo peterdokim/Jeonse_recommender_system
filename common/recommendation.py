@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, List
+from typing import Any, Dict, List
 
 import pandas as pd
 import streamlit as st
@@ -18,37 +18,49 @@ GRADE_MEANINGS = {
     "D": "위험",
 }
 
-PROFILE_WEIGHTS: Dict[str, Dict[str, float]] = {
-    "보수형": {
-        "TOTAL_SCORE": 0.24,
-        "BACKTEST_SCORE": 0.18,
-        "LOSS_EXPOSURE_SCORE": 0.20,
-        "PRICE_CONTEXT_SCORE": 0.14,
-        "BUDGET_FIT_SCORE": 0.10,
-        "COMMUTE_FIT_SCORE": 0.06,
-        "LIFESTYLE_FIT_SCORE": 0.03,
-        "SIMILARITY_SCORE": 0.05,
+SEARCH_SCOPE_OPTIONS = [
+    "현재 관심 구 우선",
+    "출퇴근권 우선",
+    "전체 후보",
+]
+
+SURVEY_QUESTIONS: List[Dict[str, str]] = [
+    {
+        "key": "survey_safe_over_distance",
+        "label": "같은 조건이라면 조금 멀어져도 더 안전한 집을 고르겠다.",
     },
-    "균형형": {
-        "TOTAL_SCORE": 0.22,
-        "BACKTEST_SCORE": 0.15,
-        "LOSS_EXPOSURE_SCORE": 0.16,
-        "PRICE_CONTEXT_SCORE": 0.12,
-        "BUDGET_FIT_SCORE": 0.10,
-        "COMMUTE_FIT_SCORE": 0.10,
-        "LIFESTYLE_FIT_SCORE": 0.08,
-        "SIMILARITY_SCORE": 0.07,
+    {
+        "key": "survey_safe_over_convenience",
+        "label": "손실 가능성이 낮다면 편의성이 다소 떨어져도 괜찮다.",
     },
-    "유연형": {
-        "TOTAL_SCORE": 0.18,
-        "BACKTEST_SCORE": 0.12,
-        "LOSS_EXPOSURE_SCORE": 0.12,
-        "PRICE_CONTEXT_SCORE": 0.10,
-        "BUDGET_FIT_SCORE": 0.10,
-        "COMMUTE_FIT_SCORE": 0.18,
-        "LIFESTYLE_FIT_SCORE": 0.12,
-        "SIMILARITY_SCORE": 0.08,
+    {
+        "key": "survey_avoid_large_loss",
+        "label": "예상 손실 가능 금액이 큰 후보는 최대한 피하고 싶다.",
     },
+    {
+        "key": "survey_accept_risk_for_commute",
+        "label": "출퇴근이 편하면 전세가율이 다소 높아도 고려할 수 있다.",
+    },
+    {
+        "key": "survey_accept_risk_for_familiarity",
+        "label": "현재 보고 있는 후보와 비슷하다면 약간의 위험은 감수할 수 있다.",
+    },
+    {
+        "key": "survey_prefer_candidate_similarity",
+        "label": "새로운 곳보다 현재 후보와 비슷한 대안을 더 선호한다.",
+    },
+]
+
+PROFILE_COEFFICIENTS: Dict[str, Dict[str, float]] = {
+    "보수형": {"alpha": 1.4, "beta": 1.2, "gamma": 0.8, "delta": 0.7},
+    "중도위험형": {"alpha": 1.0, "beta": 1.0, "gamma": 1.0, "delta": 1.0},
+    "모험형": {"alpha": 0.7, "beta": 0.8, "gamma": 1.2, "delta": 1.2},
+}
+
+PROFILE_DESCRIPTIONS = {
+    "보수형": "손실 패널티를 더 강하게 보고, 생활 편의보다 보증금 방어를 우선합니다.",
+    "중도위험형": "안전성과 생활권 적합도를 균형 있게 반영합니다.",
+    "모험형": "일부 리스크를 감수하더라도 생활권과 현재 후보 유사성을 더 반영합니다.",
 }
 
 NUMERIC_COLUMNS = [
@@ -110,6 +122,71 @@ def detect_price_unit_multiplier(df: pd.DataFrame) -> int:
 
 def estimate_loss_amount(row: pd.Series, deposit_amount: float) -> float:
     return deposit_amount * abs(float(row["JEONSE_DROP_PCT"])) / 100
+
+
+def normalize_likert(answer: int) -> float:
+    answer = max(1, min(5, int(answer)))
+    return round((answer - 1) / 4 * 100, 1)
+
+
+def classify_survey_profile(answers: Dict[str, int]) -> Dict[str, Any]:
+    safe_over_distance = normalize_likert(answers["survey_safe_over_distance"])
+    safe_over_convenience = normalize_likert(answers["survey_safe_over_convenience"])
+    avoid_large_loss = normalize_likert(answers["survey_avoid_large_loss"])
+    accept_risk_for_commute = normalize_likert(answers["survey_accept_risk_for_commute"])
+    accept_risk_for_familiarity = normalize_likert(answers["survey_accept_risk_for_familiarity"])
+    prefer_candidate_similarity = normalize_likert(answers["survey_prefer_candidate_similarity"])
+
+    safety_preference = round(
+        pd.Series(
+            [
+                safe_over_distance,
+                safe_over_convenience,
+                avoid_large_loss,
+                100 - accept_risk_for_commute,
+                100 - accept_risk_for_familiarity,
+            ]
+        ).mean(),
+        1,
+    )
+    convenience_preference = round(
+        pd.Series(
+            [
+                accept_risk_for_commute,
+                100 - safe_over_distance,
+                100 - safe_over_convenience,
+            ]
+        ).mean(),
+        1,
+    )
+    similarity_preference = round(
+        pd.Series([accept_risk_for_familiarity, prefer_candidate_similarity]).mean(),
+        1,
+    )
+
+    risk_tolerance = round(
+        (100 - safety_preference) * 0.55
+        + convenience_preference * 0.30
+        + similarity_preference * 0.15,
+        1,
+    )
+
+    if risk_tolerance < 40:
+        profile = "보수형"
+    elif risk_tolerance < 70:
+        profile = "중도위험형"
+    else:
+        profile = "모험형"
+
+    return {
+        "profile": profile,
+        "safety_preference": safety_preference,
+        "convenience_preference": convenience_preference,
+        "similarity_preference": similarity_preference,
+        "risk_tolerance": risk_tolerance,
+        "coefficients": PROFILE_COEFFICIENTS[profile],
+        "description": PROFILE_DESCRIPTIONS[profile],
+    }
 
 
 def get_area_history(history_df: pd.DataFrame, sgg: str, emd: str) -> pd.DataFrame:
@@ -191,7 +268,7 @@ def build_recommendation_dataset(
     history_df: pd.DataFrame,
     deposit_amount: int,
     workplace_sgg: str,
-    risk_profile: str,
+    survey_result: Dict[str, Any],
     preferred_pyeong: int,
     candidate_area: str,
     search_scope: str,
@@ -200,7 +277,12 @@ def build_recommendation_dataset(
     if scores_df.empty:
         return pd.DataFrame()
 
-    weights = PROFILE_WEIGHTS[risk_profile]
+    coefficients = survey_result["coefficients"]
+    alpha = float(coefficients["alpha"])
+    beta = float(coefficients["beta"])
+    gamma = float(coefficients["gamma"])
+    delta = float(coefficients["delta"])
+
     unit_multiplier = detect_price_unit_multiplier(scores_df)
     backtest_df = compute_backtest_metrics(history_df)
 
@@ -243,8 +325,7 @@ def build_recommendation_dataset(
         70 + df.loc[below_budget, "ESTIMATED_TOTAL_JEONSE"] / max(deposit_amount, 1) * 30
     ).clip(0, 100)
     df.loc[~below_budget, "BUDGET_FIT_SCORE"] = (
-        100
-        - (df.loc[~below_budget, "ESTIMATED_TOTAL_JEONSE"] - deposit_amount) / max(deposit_amount, 1) * 140
+        100 - (df.loc[~below_budget, "ESTIMATED_TOTAL_JEONSE"] - deposit_amount) / max(deposit_amount, 1) * 140
     ).clip(0, 100)
     df["BUDGET_FIT_SCORE"] = df["BUDGET_FIT_SCORE"].round(1)
 
@@ -272,8 +353,7 @@ def build_recommendation_dataset(
     candidate_rate = float(candidate_row["JEONSE_RATE"])
 
     price_similarity = (
-        100
-        - (df["ESTIMATED_TOTAL_JEONSE"] - candidate_jeonse).abs() / max(candidate_jeonse, 1) * 120
+        100 - (df["ESTIMATED_TOTAL_JEONSE"] - candidate_jeonse).abs() / max(candidate_jeonse, 1) * 120
     ).clip(0, 100)
     rate_similarity = (100 - (df["JEONSE_RATE"] - candidate_rate).abs() * 2).clip(0, 100)
     area_similarity = pd.Series(60.0, index=df.index)
@@ -293,24 +373,37 @@ def build_recommendation_dataset(
     else:
         df["AREA_SCOPE_MATCH"] = True
 
+    convenience_weight = 0.35 + float(survey_result["convenience_preference"]) / 100 * 0.30
+    lifestyle_weight = 1 - convenience_weight
+
+    df["SAFETY_SCORE"] = df["TOTAL_SCORE"].fillna(0).round(1)
+    df["LOSS_PENALTY_SCORE"] = (100 - df["LOSS_EXPOSURE_SCORE"]).clip(0, 100).round(1)
+    df["PRICE_OVERHEAT_PENALTY_SCORE"] = (100 - df["PRICE_CONTEXT_SCORE"]).clip(0, 100).round(1)
+    df["PREFERENCE_FIT_SCORE"] = (
+        df["COMMUTE_FIT_SCORE"] * convenience_weight
+        + df["LIFESTYLE_FIT_SCORE"] * lifestyle_weight
+    ).round(1)
+
+    df["RECOMMENDATION_SCORE"] = (
+        df["SAFETY_SCORE"] * 0.58
+        - df["LOSS_PENALTY_SCORE"] * 0.18 * alpha
+        - df["PRICE_OVERHEAT_PENALTY_SCORE"] * 0.10 * beta
+        + df["PREFERENCE_FIT_SCORE"] * 0.09 * gamma
+        + df["SIMILARITY_SCORE"] * 0.05 * delta
+    ).clip(0, 100).round(1)
+
+    df["PROFILE"] = survey_result["profile"]
+    df["ALPHA"] = alpha
+    df["BETA"] = beta
+    df["GAMMA"] = gamma
+    df["DELTA"] = delta
+
     df["IS_CANDIDATE"] = candidate_mask
     df["FILTER_MATCH"] = df["IS_CANDIDATE"] | (df["BUDGET_BAND_MATCH"] & df["AREA_SCOPE_MATCH"])
 
-    df["RECOMMENDATION_SCORE"] = 0.0
-    for score_column, weight in weights.items():
-        df["RECOMMENDATION_SCORE"] += df[score_column].fillna(50) * weight
-    df["RECOMMENDATION_SCORE"] = df["RECOMMENDATION_SCORE"].round(1)
-
-    df["LOSS_EXPOSURE_DELTA"] = (
-        float(candidate_row["LOSS_EXPOSURE_AMOUNT"]) - df["LOSS_EXPOSURE_AMOUNT"]
-    ).round(0)
-    df["PRICE_DELTA_TO_CANDIDATE"] = (
-        df["ESTIMATED_TOTAL_JEONSE"] - candidate_jeonse
-    ).round(0)
-
     sorted_df = df.sort_values(
-        ["FILTER_MATCH", "RECOMMENDATION_SCORE", "TOTAL_SCORE"],
-        ascending=[False, False, False],
+        ["FILTER_MATCH", "RECOMMENDATION_SCORE", "SAFETY_SCORE", "BACKTEST_SCORE"],
+        ascending=[False, False, False, False],
     ).reset_index(drop=True)
     sorted_df["RECOMMENDATION_RANK"] = sorted_df.index + 1
 
@@ -324,6 +417,13 @@ def build_recommendation_dataset(
     candidate_loss = float(
         sorted_df.loc[sorted_df["AREA_LABEL"] == candidate_area, "LOSS_EXPOSURE_AMOUNT"].iloc[0]
     )
+    sorted_df["LOSS_EXPOSURE_DELTA"] = (
+        candidate_loss - sorted_df["LOSS_EXPOSURE_AMOUNT"]
+    ).round(0)
+    sorted_df["PRICE_DELTA_TO_CANDIDATE"] = (
+        sorted_df["ESTIMATED_TOTAL_JEONSE"] - candidate_jeonse
+    ).round(0)
+
     sorted_df["BETTER_ALTERNATIVE"] = (
         (~sorted_df["IS_CANDIDATE"])
         & sorted_df["FILTER_MATCH"]
@@ -334,40 +434,57 @@ def build_recommendation_dataset(
     return sorted_df
 
 
-def build_candidate_summary(row: pd.Series) -> str:
+def build_candidate_summary(row: pd.Series, survey_result: Dict[str, Any]) -> str:
     grade_meaning = GRADE_MEANINGS.get(row["GRADE"], "참고")
     return (
-        f"{row['AREA_LABEL']}은 현재 구조 기반 안전 등급 {row['GRADE']}({grade_meaning})이며, "
-        f"전세가율 {row['JEONSE_RATE']:.1f}%, 백테스트 점수 {row['BACKTEST_SCORE']:.1f}점, "
-        f"예상 손실 노출 {format_currency_krw(row['LOSS_EXPOSURE_AMOUNT'])}으로 해석됩니다."
+        f"{row['AREA_LABEL']}은 공통 안전등급 {row['GRADE']}({grade_meaning})이며 "
+        f"객관 레이어인 안전점수는 {row['SAFETY_SCORE']:.1f}점입니다. "
+        f"이 위에 설문으로 분류된 {survey_result['profile']} 성향을 반영해 "
+        f"손실 패널티와 선호 적합도를 다시 계산한 최종 추천점수는 {row['RECOMMENDATION_SCORE']:.1f}점입니다."
     )
 
 
-def build_recommendation_reasons(row: pd.Series, candidate_row: pd.Series) -> List[str]:
+def build_profile_summary(survey_result: Dict[str, Any]) -> str:
+    coeff = survey_result["coefficients"]
+    return (
+        f"{survey_result['profile']}으로 분류되었습니다. "
+        f"안전 선호 {survey_result['safety_preference']:.1f}점, "
+        f"편의 선호 {survey_result['convenience_preference']:.1f}점, "
+        f"유사성 선호 {survey_result['similarity_preference']:.1f}점이며, "
+        f"추천 계산에는 α={coeff['alpha']:.1f}, β={coeff['beta']:.1f}, "
+        f"γ={coeff['gamma']:.1f}, δ={coeff['delta']:.1f}가 적용됩니다."
+    )
+
+
+def build_recommendation_reasons(
+    row: pd.Series,
+    candidate_row: pd.Series,
+    survey_result: Dict[str, Any],
+) -> List[str]:
     reasons: List[str] = []
+    profile = survey_result["profile"]
 
-    if float(row["VS_CANDIDATE_DELTA"]) > 0:
-        reasons.append(f"현재 후보 대비 추천 점수가 {row['VS_CANDIDATE_DELTA']:.1f}점 높습니다.")
-
-    loss_gap = float(candidate_row["LOSS_EXPOSURE_AMOUNT"]) - float(row["LOSS_EXPOSURE_AMOUNT"])
-    if loss_gap > 0:
-        reasons.append(f"입력 보증금 기준 손실 노출이 {format_currency_krw(loss_gap)} 낮습니다.")
-
-    if float(row["JEONSE_RATE"]) < float(candidate_row["JEONSE_RATE"]):
+    if profile == "보수형" and float(row["LOSS_EXPOSURE_DELTA"]) > 0:
         reasons.append(
-            f"전세가율이 {candidate_row['JEONSE_RATE']:.1f}%에서 {row['JEONSE_RATE']:.1f}%로 더 낮습니다."
+            f"보수형 기준에서 손실 노출이 {format_currency_krw(row['LOSS_EXPOSURE_DELTA'])} 낮아 우선순위가 올라갔습니다."
+        )
+    elif profile == "모험형" and float(row["PREFERENCE_FIT_SCORE"]) >= float(candidate_row["PREFERENCE_FIT_SCORE"]):
+        reasons.append("모험형 기준에서 생활권 적합도와 현재 후보 유사성이 더 잘 맞습니다.")
+    elif float(row["VS_CANDIDATE_DELTA"]) > 0:
+        reasons.append(f"현재 후보 대비 최종 추천점수가 {row['VS_CANDIDATE_DELTA']:.1f}점 높습니다.")
+
+    if float(row["LOSS_EXPOSURE_DELTA"]) > 0:
+        reasons.append(
+            f"입력 보증금 기준 예상 손실 노출이 {format_currency_krw(row['LOSS_EXPOSURE_DELTA'])} 낮습니다."
         )
 
-    if float(row["BACKTEST_SCORE"]) > float(candidate_row["BACKTEST_SCORE"]):
-        reasons.append(
-            f"백테스트 점수가 {candidate_row['BACKTEST_SCORE']:.1f}점보다 높은 {row['BACKTEST_SCORE']:.1f}점입니다."
-        )
+    if float(row["PRICE_OVERHEAT_PENALTY_SCORE"]) < float(candidate_row["PRICE_OVERHEAT_PENALTY_SCORE"]):
+        reasons.append("가격 과열 패널티가 현재 후보보다 낮아 가격 부담이 덜합니다.")
 
-    if bool(row["BUDGET_BAND_MATCH"]):
-        reasons.append("예산 밴드 안에 들어와 실제 대안 후보로 보기 좋습니다.")
+    if float(row["PREFERENCE_FIT_SCORE"]) > float(candidate_row["PREFERENCE_FIT_SCORE"]):
+        reasons.append("생활권 적합도가 더 높아 설문 응답 기준 선호 조건과 더 잘 맞습니다.")
 
     if str(row["SGG"]) == str(candidate_row["SGG"]):
         reasons.append("현재 관심 구를 유지하면서 더 안전한 대안을 제시합니다.")
 
     return reasons[:3]
-
