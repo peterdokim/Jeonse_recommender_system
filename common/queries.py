@@ -7,29 +7,96 @@ BASE_VIEW = "HACKATHON_APP.RESILIENCE.RESILIENCE_BASE"
 
 
 @st.cache_data(show_spinner=False)
-def load_scores(_session: Session) -> pd.DataFrame:
+def load_latest_market_snapshot(_session: Session) -> pd.DataFrame:
     query = f"""
+        WITH ranked AS (
+            SELECT
+                SGG,
+                EMD,
+                YYYYMMDD,
+                PRICE,
+                JEONSE_PRICE,
+                AVG_ASSET,
+                AVG_INCOME,
+                AVG_CREDIT_SCORE,
+                AVG_LOAN,
+                RES_POP,
+                WORK_POP,
+                VISIT_POP,
+                ROW_NUMBER() OVER (
+                    PARTITION BY SGG, EMD
+                    ORDER BY YYYYMMDD DESC
+                ) AS RN
+            FROM {BASE_VIEW}
+        )
         SELECT
             SGG,
             EMD,
-            MEME_LATEST,
-            JEONSE_LATEST,
-            JEONSE_RATE,
-            JEONSE_DROP_PCT,
-            HUG_RATE,
-            POP_CHANGE_PCT,
+            YYYYMMDD,
+            PRICE,
+            JEONSE_PRICE,
             AVG_ASSET,
-            AVG_DISTANCE_M,
-            S1_RATE,
-            S2_DROP,
-            S3_HUG,
-            S4_POP,
-            S5_ASSET,
-            S6_SUBWAY,
-            TOTAL_SCORE,
-            GRADE
-        FROM {SCORE_TABLE}
-        ORDER BY TOTAL_SCORE DESC, SGG, EMD
+            AVG_INCOME,
+            AVG_CREDIT_SCORE,
+            AVG_LOAN,
+            RES_POP,
+            WORK_POP,
+            VISIT_POP
+        FROM ranked
+        WHERE RN = 1
+        ORDER BY SGG, EMD
+    """
+    return _session.sql(query).to_pandas()
+
+
+@st.cache_data(show_spinner=False)
+def load_scores(_session: Session) -> pd.DataFrame:
+    query = f"""
+        WITH latest_snapshot AS (
+            SELECT
+                SGG,
+                EMD,
+                AVG_ASSET,
+                AVG_INCOME,
+                AVG_CREDIT_SCORE,
+                AVG_LOAN,
+                RES_POP,
+                WORK_POP,
+                VISIT_POP,
+                ROW_NUMBER() OVER (
+                    PARTITION BY SGG, EMD
+                    ORDER BY YYYYMMDD DESC
+                ) AS RN
+            FROM {BASE_VIEW}
+        )
+        SELECT
+            s.SGG,
+            s.EMD,
+            s.MEME_LATEST,
+            s.JEONSE_LATEST,
+            s.JEONSE_RATE,
+            s.JEONSE_DROP_PCT,
+            s.HUG_RATE,
+            s.NET_MIG,
+            s.SUBWAY_DIST,
+            s.S_RATE,
+            s.S_MIG,
+            s.S_SUB,
+            s.TOTAL_SCORE,
+            s.GRADE,
+            b.AVG_ASSET,
+            b.AVG_INCOME,
+            b.AVG_CREDIT_SCORE,
+            b.AVG_LOAN,
+            b.RES_POP,
+            b.WORK_POP,
+            b.VISIT_POP
+        FROM {SCORE_TABLE} s
+        LEFT JOIN latest_snapshot b
+            ON s.SGG = b.SGG
+           AND s.EMD = b.EMD
+           AND b.RN = 1
+        ORDER BY s.TOTAL_SCORE DESC, s.SGG, s.EMD
     """
     return _session.sql(query).to_pandas()
 
@@ -74,49 +141,6 @@ def load_market_summary(_session: Session) -> pd.DataFrame:
             AVG(JEONSE_PRICE) AS AVG_JEONSE_PRICE
         FROM {BASE_VIEW}
         GROUP BY SGG, EMD
-        ORDER BY SGG, EMD
-    """
-    return _session.sql(query).to_pandas()
-
-
-@st.cache_data(show_spinner=False)
-def load_latest_market_snapshot(_session: Session) -> pd.DataFrame:
-    query = f"""
-        WITH ranked AS (
-            SELECT
-                SGG,
-                EMD,
-                YYYYMMDD,
-                PRICE,
-                JEONSE_PRICE,
-                AVG_ASSET,
-                AVG_INCOME,
-                AVG_CREDIT_SCORE,
-                AVG_LOAN,
-                RES_POP,
-                WORK_POP,
-                VISIT_POP,
-                ROW_NUMBER() OVER (
-                    PARTITION BY SGG, EMD
-                    ORDER BY YYYYMMDD DESC
-                ) AS RN
-            FROM {BASE_VIEW}
-        )
-        SELECT
-            SGG,
-            EMD,
-            YYYYMMDD,
-            PRICE,
-            JEONSE_PRICE,
-            AVG_ASSET,
-            AVG_INCOME,
-            AVG_CREDIT_SCORE,
-            AVG_LOAN,
-            RES_POP,
-            WORK_POP,
-            VISIT_POP
-        FROM ranked
-        WHERE RN = 1
         ORDER BY SGG, EMD
     """
     return _session.sql(query).to_pandas()

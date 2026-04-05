@@ -1,0 +1,177 @@
+-- =============================================
+-- 전세 안심 검진소 — 팀원 계정 세팅 SQL (v4)
+--
+-- 사전 준비:
+-- 1. Snowflake Marketplace에서 아래 2개 데이터 Get:
+--    - 리치고: "Korea Real Estate Apartment Market Intelligence" (HACKATHON_2026)
+--    - SPH: "Seoul DistrictLevel Data Floating Population Consumption and Assets" (GRANDATA)
+-- 2. 아래 SQL을 STEP별로 하나씩 실행
+-- =============================================
+
+-- ============ STEP 1: DB + 스키마 생성 ============
+CREATE DATABASE IF NOT EXISTS HACKATHON_APP;
+CREATE SCHEMA IF NOT EXISTS HACKATHON_APP.RESILIENCE;
+
+-- ============ STEP 2: HUG 전세보증 사고 데이터 ============
+-- 출처: 공공데이터포털 "주택도시보증공사_지역별_전세금반환보증_사고현황"
+-- 용도: 백테스팅 검증용 (점수에 포함하지 않음)
+CREATE OR REPLACE TABLE HACKATHON_APP.RESILIENCE.HUG_ACCIDENT (
+    GU_CODE VARCHAR,
+    GU_NAME VARCHAR,
+    ACCIDENT_COUNT NUMBER,
+    ACCIDENT_AMOUNT NUMBER,
+    ACCIDENT_RATE FLOAT
+);
+
+INSERT INTO HACKATHON_APP.RESILIENCE.HUG_ACCIDENT VALUES
+('11110', '종로구', 3, 527000000, 1.0),
+('11140', '중구', 2, 350000000, 0.4),
+('11170', '용산구', 5, 1290000000, 0.7),
+('11200', '성동구', 1, 300000000, 0.2),
+('11215', '광진구', 10, 2350000000, 1.4),
+('11230', '동대문구', 9, 2033690000, 1.0),
+('11260', '중랑구', 24, 4903750000, 3.3),
+('11290', '성북구', 5, 1445500000, 0.8),
+('11305', '강북구', 6, 1365000000, 1.5),
+('11320', '도봉구', 8, 1600000000, 1.3),
+('11350', '노원구', 6, 1396750000, 0.6),
+('11380', '은평구', 6, 1752000000, 0.6),
+('11410', '서대문구', 7, 1682000000, 1.2),
+('11440', '마포구', 4, 760000000, 0.3),
+('11470', '양천구', 18, 4477000000, 1.8),
+('11500', '강서구', 84, 18031270000, 2.9),
+('11530', '구로구', 21, 4129400000, 2.1),
+('11545', '금천구', 9, 1556000000, 1.0),
+('11560', '영등포구', 30, 7456770000, 1.8),
+('11590', '동작구', 5, 1111000000, 0.6),
+('11620', '관악구', 16, 4199500000, 2.7),
+('11650', '서초구', 5, 1573500000, 0.8),
+('11680', '강남구', 5, 1585000000, 0.6),
+('11710', '송파구', 16, 3253500000, 0.8),
+('11740', '강동구', 13, 2727500000, 1.1);
+
+-- ============ STEP 3: 통합 베이스 VIEW ============
+CREATE OR REPLACE VIEW HACKATHON_APP.RESILIENCE.RESILIENCE_BASE AS
+SELECT
+    r.SGG,
+    r.EMD,
+    r.YYYYMMDD,
+    r.MEME_PRICE_PER_SUPPLY_PYEONG AS PRICE,
+    r.JEONSE_PRICE_PER_SUPPLY_PYEONG AS JEONSE_PRICE,
+    AVG(a.AVERAGE_ASSET_AMOUNT) AS AVG_ASSET,
+    AVG(a.AVERAGE_INCOME) AS AVG_INCOME,
+    AVG(a.AVERAGE_SCORE) AS AVG_CREDIT_SCORE,
+    AVG(a.AVERAGE_BALANCE_AMOUNT) AS AVG_LOAN,
+    AVG(f.RESIDENTIAL_POPULATION) AS RES_POP,
+    AVG(f.WORKING_POPULATION) AS WORK_POP,
+    AVG(f.VISITING_POPULATION) AS VISIT_POP
+FROM Korea_Real_Estate_Apartment_Market_Intelligence.HACKATHON_2026.REGION_APT_RICHGO_MARKET_PRICE_M_H r
+JOIN Seoul_DistrictLevel_Data_Floating_Population_Consumption_and_Assets.GRANDATA.M_SCCO_MST m
+    ON r.SGG = m.CITY_KOR_NAME AND r.EMD = m.DISTRICT_KOR_NAME
+LEFT JOIN Seoul_DistrictLevel_Data_Floating_Population_Consumption_and_Assets.GRANDATA.ASSET_INCOME_INFO a
+    ON m.PROVINCE_CODE = a.PROVINCE_CODE AND m.CITY_CODE = a.CITY_CODE AND m.DISTRICT_CODE = a.DISTRICT_CODE
+    AND TO_CHAR(r.YYYYMMDD, 'YYYYMM') = TO_CHAR(a.STANDARD_YEAR_MONTH)
+LEFT JOIN Seoul_DistrictLevel_Data_Floating_Population_Consumption_and_Assets.GRANDATA.FLOATING_POPULATION_INFO f
+    ON m.PROVINCE_CODE = f.PROVINCE_CODE AND m.CITY_CODE = f.CITY_CODE AND m.DISTRICT_CODE = f.DISTRICT_CODE
+    AND TO_CHAR(r.YYYYMMDD, 'YYYYMM') = TO_CHAR(f.STANDARD_YEAR_MONTH)
+WHERE r.EMD IS NOT NULL AND r.EMD != ''
+GROUP BY r.SGG, r.EMD, r.YYYYMMDD, r.MEME_PRICE_PER_SUPPLY_PYEONG, r.JEONSE_PRICE_PER_SUPPLY_PYEONG;
+
+-- ============ STEP 4: 전세 안전 점수 VIEW ============
+-- 모델: 전세가율(50%) + 전입전출(25%) + 지하철(25%)
+-- 점수: 연속 percentile (1등=100점, 꼴등=0점)
+CREATE OR REPLACE VIEW HACKATHON_APP.RESILIENCE.JEONSE_SAFETY_SCORE AS
+WITH all_dong_rate AS (
+    SELECT
+        SGG,
+        EMD,
+        MAX(CASE WHEN YYYYMMDD = '2024-12-01' THEN JEONSE_PRICE_PER_SUPPLY_PYEONG END)
+            / NULLIF(MAX(CASE WHEN YYYYMMDD = '2024-12-01' THEN MEME_PRICE_PER_SUPPLY_PYEONG END), 0) * 100 AS JEONSE_RATE,
+        ROUND(
+            (
+                MIN(CASE WHEN YYYYMMDD >= '2022-06-01' THEN JEONSE_PRICE_PER_SUPPLY_PYEONG END)
+                - MAX(CASE WHEN YYYYMMDD <= '2022-12-01' THEN JEONSE_PRICE_PER_SUPPLY_PYEONG END)
+            )
+            / MAX(CASE WHEN YYYYMMDD <= '2022-12-01' THEN JEONSE_PRICE_PER_SUPPLY_PYEONG END) * 100,
+            1
+        ) AS JEONSE_DROP_PCT,
+        ROUND(MAX(CASE WHEN YYYYMMDD = '2024-12-01' THEN JEONSE_PRICE_PER_SUPPLY_PYEONG END), 0) AS JEONSE_LATEST,
+        ROUND(MAX(CASE WHEN YYYYMMDD = '2024-12-01' THEN MEME_PRICE_PER_SUPPLY_PYEONG END), 0) AS MEME_LATEST
+    FROM Korea_Real_Estate_Apartment_Market_Intelligence.HACKATHON_2026.REGION_APT_RICHGO_MARKET_PRICE_M_H
+    WHERE EMD IS NOT NULL AND EMD != ''
+    GROUP BY SGG, EMD
+),
+rate_scored AS (
+    SELECT
+        *,
+        ROUND(PERCENT_RANK() OVER (ORDER BY JEONSE_RATE DESC) * 100, 1) AS S_RATE
+    FROM all_dong_rate
+),
+subway_scored AS (
+    SELECT
+        SGG,
+        EMD,
+        ROUND(AVG(MIN_DIST), 0) AS SUBWAY_DIST,
+        ROUND(PERCENT_RANK() OVER (ORDER BY AVG(MIN_DIST) DESC) * 100, 1) AS S_SUB
+    FROM (
+        SELECT
+            SGG,
+            EMD,
+            DANJI_ID,
+            MIN(DISTANCE) AS MIN_DIST
+        FROM Korea_Real_Estate_Apartment_Market_Intelligence.HACKATHON_2026.APT_DANJI_AND_TRANSPORTATION_TRAIN_DISTANCE
+        GROUP BY SGG, EMD, DANJI_ID
+    )
+    GROUP BY SGG, EMD
+),
+mig_scored AS (
+    SELECT
+        SGG,
+        SUM(POPULATION) AS NET_MIG,
+        ROUND(PERCENT_RANK() OVER (ORDER BY SUM(POPULATION) ASC) * 100, 1) AS S_MIG
+    FROM Korea_Real_Estate_Apartment_Market_Intelligence.HACKATHON_2026.REGION_POPULATION_MOVEMENT
+    WHERE SD = '서울'
+      AND REGION_LEVEL = 'sgg'
+      AND MOVEMENT_TYPE = '순이동'
+      AND YYYYMMDD BETWEEN '2024-01-01' AND '2024-12-01'
+    GROUP BY SGG
+),
+hug AS (
+    SELECT GU_NAME, ACCIDENT_RATE
+    FROM HACKATHON_APP.RESILIENCE.HUG_ACCIDENT
+)
+SELECT
+    r.SGG,
+    r.EMD,
+    r.MEME_LATEST,
+    r.JEONSE_LATEST,
+    ROUND(r.JEONSE_RATE, 1) AS JEONSE_RATE,
+    r.JEONSE_DROP_PCT,
+    h.ACCIDENT_RATE AS HUG_RATE,
+    m.NET_MIG,
+    s.SUBWAY_DIST,
+    r.S_RATE,
+    m.S_MIG,
+    s.S_SUB,
+    ROUND(r.S_RATE * 0.50 + m.S_MIG * 0.25 + s.S_SUB * 0.25, 1) AS TOTAL_SCORE,
+    CASE
+        WHEN ROUND(r.S_RATE * 0.50 + m.S_MIG * 0.25 + s.S_SUB * 0.25, 1) >= 80 THEN 'A'
+        WHEN ROUND(r.S_RATE * 0.50 + m.S_MIG * 0.25 + s.S_SUB * 0.25, 1) >= 60 THEN 'B'
+        WHEN ROUND(r.S_RATE * 0.50 + m.S_MIG * 0.25 + s.S_SUB * 0.25, 1) >= 40 THEN 'C'
+        ELSE 'D'
+    END AS GRADE
+FROM rate_scored r
+LEFT JOIN subway_scored s ON r.SGG = s.SGG AND r.EMD = s.EMD
+LEFT JOIN mig_scored m ON r.SGG = m.SGG
+LEFT JOIN hug h ON r.SGG = h.GU_NAME
+WHERE r.SGG IN ('서초구', '영등포구', '중구');
+
+-- ============ STEP 5: 확인 ============
+SELECT
+    SGG,
+    EMD,
+    JEONSE_RATE,
+    TOTAL_SCORE,
+    GRADE
+FROM HACKATHON_APP.RESILIENCE.JEONSE_SAFETY_SCORE
+ORDER BY TOTAL_SCORE DESC;
