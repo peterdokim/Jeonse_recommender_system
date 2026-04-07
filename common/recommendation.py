@@ -27,27 +27,27 @@ SEARCH_SCOPE_OPTIONS = [
 SURVEY_QUESTIONS: List[Dict[str, str]] = [
     {
         "key": "survey_safe_over_distance",
-        "label": "같은 조건이라면 조금 멀어져도 더 안전한 집을 고르겠다.",
+        "label": "출퇴근이 좀 멀어지더라도, 보증금이 더 안전한 집을 고르겠다.",
     },
     {
         "key": "survey_safe_over_convenience",
-        "label": "손실 가능성이 낮다면 편의성이 다소 떨어져도 괜찮다.",
+        "label": "주변 편의시설이 좀 부족해도, 보증금을 안전하게 돌려받을 수 있는 게 낫다.",
     },
     {
         "key": "survey_avoid_large_loss",
-        "label": "예상 손실 가능 금액이 큰 후보는 최대한 피하고 싶다.",
+        "label": "보증금을 크게 잃을 수 있는 집은 무조건 피하고 싶다.",
     },
     {
         "key": "survey_accept_risk_for_commute",
-        "label": "출퇴근이 편하면 전세가율이 다소 높아도 고려할 수 있다.",
+        "label": "출퇴근이 편하다면, 위험이 좀 있어도 고려할 수 있다.",
     },
     {
         "key": "survey_accept_risk_for_familiarity",
-        "label": "현재 보고 있는 후보와 비슷하다면 약간의 위험은 감수할 수 있다.",
+        "label": "지금 보고 있는 집이랑 비슷한 조건이면, 약간의 위험은 괜찮다.",
     },
     {
         "key": "survey_prefer_candidate_similarity",
-        "label": "새로운 곳보다 현재 후보와 비슷한 대안을 더 선호한다.",
+        "label": "새로운 동네보다는, 지금 보고 있는 곳과 비슷한 동네가 편하다.",
     },
 ]
 
@@ -58,9 +58,15 @@ PROFILE_COEFFICIENTS: Dict[str, Dict[str, float]] = {
 }
 
 PROFILE_DESCRIPTIONS = {
-    "보수형": "손실 패널티를 더 강하게 보고, 생활 편의보다 보증금 방어를 우선합니다.",
-    "중도위험형": "안전성과 생활권 적합도를 균형 있게 반영합니다.",
-    "모험형": "일부 리스크를 감수하더라도 생활권과 현재 후보 유사성을 더 반영합니다.",
+    "보수형": "보증금을 안전하게 지키는 걸 가장 중요하게 생각해요.",
+    "중도위험형": "안전성과 생활 편의를 균형 있게 고려해요.",
+    "모험형": "편리한 생활권이라면 어느 정도 위험은 감수할 수 있어요.",
+}
+
+PROFILE_ICONS = {
+    "보수형": "security",
+    "중도위험형": "balance",
+    "모험형": "explore",
 }
 
 NUMERIC_COLUMNS = [
@@ -137,43 +143,32 @@ def classify_survey_profile(answers: Dict[str, int]) -> Dict[str, Any]:
     accept_risk_for_familiarity = normalize_likert(answers["survey_accept_risk_for_familiarity"])
     prefer_candidate_similarity = normalize_likert(answers["survey_prefer_candidate_similarity"])
 
+    # Q1~Q3: 높을수록 안전 지향 (동의 = 보수적)
     safety_preference = round(
-        pd.Series(
-            [
-                safe_over_distance,
-                safe_over_convenience,
-                avoid_large_loss,
-                100 - accept_risk_for_commute,
-                100 - accept_risk_for_familiarity,
-            ]
-        ).mean(),
+        (safe_over_distance + safe_over_convenience + avoid_large_loss) / 3,
         1,
     )
-    convenience_preference = round(
-        pd.Series(
-            [
-                accept_risk_for_commute,
-                100 - safe_over_distance,
-                100 - safe_over_convenience,
-            ]
-        ).mean(),
-        1,
-    )
+
+    # Q4: 높을수록 편의 지향 (동의 = 모험적)
+    convenience_preference = round(accept_risk_for_commute, 1)
+
+    # Q5~Q6: 높을수록 유사성 지향 (동의 = 모험적)
     similarity_preference = round(
-        pd.Series([accept_risk_for_familiarity, prefer_candidate_similarity]).mean(),
+        (accept_risk_for_familiarity + prefer_candidate_similarity) / 2,
         1,
     )
 
+    # risk_tolerance: 안전 선호가 높으면 낮고, 편의/유사성이 높으면 높음
     risk_tolerance = round(
-        (100 - safety_preference) * 0.55
-        + convenience_preference * 0.30
-        + similarity_preference * 0.15,
+        (100 - safety_preference) * 0.50
+        + convenience_preference * 0.25
+        + similarity_preference * 0.25,
         1,
     )
 
-    if risk_tolerance < 40:
+    if risk_tolerance < 35:
         profile = "보수형"
-    elif risk_tolerance < 70:
+    elif risk_tolerance < 65:
         profile = "중도위험형"
     else:
         profile = "모험형"
@@ -362,9 +357,10 @@ def build_recommendation_dataset(
         price_similarity * 0.50 + rate_similarity * 0.30 + area_similarity * 0.20
     ).round(1)
 
-    lower_budget = deposit_amount * (1 - budget_tolerance_pct / 100)
+    # 보증금 이하 + 허용 범위만큼 위까지 포함
+    # 예: 보증금 5억, 허용 10% → 0원 ~ 5.5억까지 매칭
     upper_budget = deposit_amount * (1 + budget_tolerance_pct / 100)
-    df["BUDGET_BAND_MATCH"] = df["ESTIMATED_TOTAL_JEONSE"].between(lower_budget, upper_budget)
+    df["BUDGET_BAND_MATCH"] = df["ESTIMATED_TOTAL_JEONSE"] <= upper_budget
 
     if search_scope == "현재 관심 구 우선":
         df["AREA_SCOPE_MATCH"] = df["SGG"] == candidate_sgg
@@ -384,12 +380,14 @@ def build_recommendation_dataset(
         + df["LIFESTYLE_FIT_SCORE"] * lifestyle_weight
     ).round(1)
 
+    # README 수식과 일치:
+    # 추천점수 = 안전점수 - α*손실패널티 - β*가격과열패널티 + γ*선호적합도 + δ*유사도
     df["RECOMMENDATION_SCORE"] = (
-        df["SAFETY_SCORE"] * 0.58
-        - df["LOSS_PENALTY_SCORE"] * 0.18 * alpha
-        - df["PRICE_OVERHEAT_PENALTY_SCORE"] * 0.10 * beta
-        + df["PREFERENCE_FIT_SCORE"] * 0.09 * gamma
-        + df["SIMILARITY_SCORE"] * 0.05 * delta
+        df["SAFETY_SCORE"]
+        - df["LOSS_PENALTY_SCORE"] * alpha
+        - df["PRICE_OVERHEAT_PENALTY_SCORE"] * beta
+        + df["PREFERENCE_FIT_SCORE"] * gamma
+        + df["SIMILARITY_SCORE"] * delta
     ).clip(0, 100).round(1)
 
     df["PROFILE"] = survey_result["profile"]
@@ -434,6 +432,78 @@ def build_recommendation_dataset(
     return sorted_df
 
 
+def pick_typed_alternatives(
+    better_df: pd.DataFrame,
+    candidate_row: pd.Series,
+) -> Dict[str, Any]:
+    """3가지 유형의 대안을 선별한다.
+
+    Returns:
+        dict with keys "safest", "balanced", "similar" — 각각 Series or None.
+    """
+    result: Dict[str, Any] = {"safest": None, "balanced": None, "similar": None}
+    if better_df.empty:
+        return result
+
+    # 1. 가장 안전한 대안: 손실 노출이 가장 낮은 후보
+    safest = better_df.sort_values("LOSS_EXPOSURE_AMOUNT", ascending=True).iloc[0]
+    result["safest"] = safest
+
+    # 2. 가장 균형 잡힌 대안: 추천점수(안전+선호 종합) 1위
+    balanced = better_df.sort_values("RECOMMENDATION_SCORE", ascending=False).iloc[0]
+    # safest와 같으면 2위로
+    if balanced["AREA_LABEL"] == safest["AREA_LABEL"] and len(better_df) > 1:
+        balanced = better_df.sort_values("RECOMMENDATION_SCORE", ascending=False).iloc[1]
+    result["balanced"] = balanced
+
+    # 3. 현재 후보와 가장 비슷하지만 더 안전한 대안: 유사도 점수 1위
+    similar = better_df.sort_values("SIMILARITY_SCORE", ascending=False).iloc[0]
+    # 위 2개와 중복되면 다음 후보
+    used = {safest["AREA_LABEL"], balanced["AREA_LABEL"]}
+    similar_candidates = better_df.sort_values("SIMILARITY_SCORE", ascending=False)
+    for _, row in similar_candidates.iterrows():
+        if row["AREA_LABEL"] not in used:
+            similar = row
+            break
+    result["similar"] = similar
+
+    return result
+
+
+def build_card_description(
+    row: pd.Series,
+    candidate_row: pd.Series,
+) -> List[str]:
+    """추천 카드에 표시할 핵심 개선 포인트 리스트를 반환한다."""
+    points: List[str] = []
+
+    delta = float(row["VS_CANDIDATE_DELTA"])
+    if delta > 0:
+        points.append(f"현재 후보보다 종합 점수 **+{delta:.1f}점**")
+
+    loss_diff = float(candidate_row["LOSS_EXPOSURE_AMOUNT"]) - float(row["LOSS_EXPOSURE_AMOUNT"])
+    if loss_diff > 0:
+        points.append(f"입력 보증금 기준 손실 노출 **{format_currency_krw(loss_diff)} 감소**")
+
+    cand_rate = float(candidate_row.get("JEONSE_RATE", 0))
+    row_rate = float(row.get("JEONSE_RATE", 0))
+    if cand_rate > 0 and row_rate < cand_rate:
+        points.append(f"전세가율 **{cand_rate:.1f}% → {row_rate:.1f}%**로 가격 부담 완화")
+
+    grade_order = {"A": 0, "B": 1, "C": 2, "D": 3}
+    if grade_order.get(str(row.get("GRADE", "")), 9) < grade_order.get(str(candidate_row.get("GRADE", "")), 9):
+        points.append(f"안전등급 **{row['GRADE']}** (현재 후보 {candidate_row['GRADE']})")
+
+    if str(row.get("SGG", "")) == str(candidate_row.get("SGG", "")):
+        points.append("현재 관심 구 **생활권 유지**")
+
+    pref_diff = float(row.get("PREFERENCE_FIT_SCORE", 0)) - float(candidate_row.get("PREFERENCE_FIT_SCORE", 0))
+    if pref_diff > 5:
+        points.append(f"생활권 적합도 **+{pref_diff:.1f}점** 개선")
+
+    return points[:5]
+
+
 def build_candidate_summary(row: pd.Series, survey_result: Dict[str, Any]) -> str:
     grade_meaning = GRADE_MEANINGS.get(row["GRADE"], "참고")
     return (
@@ -445,15 +515,9 @@ def build_candidate_summary(row: pd.Series, survey_result: Dict[str, Any]) -> st
 
 
 def build_profile_summary(survey_result: Dict[str, Any]) -> str:
-    coeff = survey_result["coefficients"]
-    return (
-        f"{survey_result['profile']}으로 분류되었습니다. "
-        f"안전 선호 {survey_result['safety_preference']:.1f}점, "
-        f"편의 선호 {survey_result['convenience_preference']:.1f}점, "
-        f"유사성 선호 {survey_result['similarity_preference']:.1f}점이며, "
-        f"추천 계산에는 α={coeff['alpha']:.1f}, β={coeff['beta']:.1f}, "
-        f"γ={coeff['gamma']:.1f}, δ={coeff['delta']:.1f}가 적용됩니다."
-    )
+    profile = survey_result["profile"]
+    desc = PROFILE_DESCRIPTIONS.get(profile, "")
+    return f"{profile} — {desc}"
 
 
 def build_recommendation_reasons(
@@ -488,3 +552,51 @@ def build_recommendation_reasons(
         reasons.append("현재 관심 구를 유지하면서 더 안전한 대안을 제시합니다.")
 
     return reasons[:3]
+
+
+def build_exclusion_reasons(row: pd.Series, candidate_row: pd.Series) -> List[str]:
+    """해당 지역이 추천 대안에서 제외된 이유를 반환한다."""
+    reasons: List[str] = []
+
+    # 필터 조건
+    if not row.get("BUDGET_BAND_MATCH", True):
+        reasons.append(
+            f"추정 전세가({format_currency_krw(row['ESTIMATED_TOTAL_JEONSE'])})가 "
+            f"입력 보증금보다 높음"
+        )
+
+    if not row.get("AREA_SCOPE_MATCH", True):
+        reasons.append("설정한 탐색 범위(구/생활권) 밖")
+
+    # 안전 등급
+    cand_grade = str(candidate_row.get("GRADE", ""))
+    row_grade = str(row.get("GRADE", ""))
+    grade_order = {"A": 0, "B": 1, "C": 2, "D": 3}
+    if grade_order.get(row_grade, 0) > grade_order.get(cand_grade, 0):
+        reasons.append(
+            f"안전등급 {row_grade}({GRADE_MEANINGS.get(row_grade, '')})로 "
+            f"현재 후보({cand_grade})보다 낮음"
+        )
+
+    # 추천점수
+    if float(row["RECOMMENDATION_SCORE"]) <= float(candidate_row["RECOMMENDATION_SCORE"]):
+        delta = float(candidate_row["RECOMMENDATION_SCORE"]) - float(row["RECOMMENDATION_SCORE"])
+        reasons.append(f"최종 추천점수가 현재 후보보다 {delta:.1f}점 낮음")
+
+    # 손실 노출
+    if float(row["LOSS_EXPOSURE_AMOUNT"]) > float(candidate_row["LOSS_EXPOSURE_AMOUNT"]):
+        diff = float(row["LOSS_EXPOSURE_AMOUNT"]) - float(candidate_row["LOSS_EXPOSURE_AMOUNT"])
+        reasons.append(f"예상 손실 노출이 {format_currency_krw(diff)} 더 높음")
+
+    # 전세가율 과열
+    jeonse_rate = float(row.get("JEONSE_RATE", 0))
+    if jeonse_rate > 80:
+        reasons.append(f"전세가율 {jeonse_rate:.1f}%로 가격 부담이 큼")
+
+    # 과거 가격 하락 이력
+    backtest = float(row.get("BACKTEST_SCORE", 50))
+    cand_backtest = float(candidate_row.get("BACKTEST_SCORE", 50))
+    if backtest < 30 and backtest < cand_backtest:
+        reasons.append("과거 전세가 하락폭이 커서 가격 안정성이 낮음")
+
+    return reasons[:4]
