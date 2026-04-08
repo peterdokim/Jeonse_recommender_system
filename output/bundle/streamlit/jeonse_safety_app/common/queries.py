@@ -102,6 +102,17 @@ def load_scores(_session: Session) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner=False)
+def load_grade_summary(_session: Session) -> pd.DataFrame:
+    query = f"""
+        SELECT GRADE, COUNT(*) AS AREA_COUNT
+        FROM {SCORE_TABLE}
+        GROUP BY GRADE
+        ORDER BY GRADE
+    """
+    return _session.sql(query).to_pandas()
+
+
+@st.cache_data(show_spinner=False)
 def load_area_history(_session: Session, sgg: str, emd: str) -> pd.DataFrame:
     safe_sgg = sgg.replace("'", "''")
     safe_emd = emd.replace("'", "''")

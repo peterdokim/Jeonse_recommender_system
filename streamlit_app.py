@@ -1,8 +1,10 @@
+import json
+
 import altair as alt
 import pandas as pd
 import streamlit as st
 
-from common.queries import load_all_area_history, load_grade_summary, load_scores
+from common.queries import load_all_area_history, load_scores
 from common.recommendation import (
     DIMENSION_LABELS,
     GRADE_MEANINGS,
@@ -51,6 +53,152 @@ def _profile_card_html(profile: str) -> str:
         f'<div class="profile-card-name">{profile}</div>'
         f'<div class="profile-card-desc">{desc}</div>'
         f"</div></div>"
+    )
+
+
+def _format_pct(value: float | None) -> str:
+    if value is None or pd.isna(value):
+        return "-"
+    sign = "+" if value > 0 else ""
+    return f"{sign}{value:.1f}%"
+
+
+def _safe_pct_change(current: float | None, previous: float | None) -> float | None:
+    if current is None or previous is None:
+        return None
+    if pd.isna(current) or pd.isna(previous) or float(previous) == 0:
+        return None
+    return round((float(current) - float(previous)) / float(previous) * 100, 1)
+
+
+def build_market_flow_snapshot(history_df: pd.DataFrame) -> dict[str, object]:
+    if history_df.empty:
+        return {}
+
+    ordered = history_df.sort_values("YYYYMMDD").copy()
+    ordered["PRICE"] = pd.to_numeric(ordered["PRICE"], errors="coerce")
+    ordered["JEONSE_PRICE"] = pd.to_numeric(ordered["JEONSE_PRICE"], errors="coerce")
+    ordered = ordered.dropna(subset=["PRICE", "JEONSE_PRICE"], how="all").reset_index(drop=True)
+    if ordered.empty:
+        return {}
+
+    latest = ordered.iloc[-1]
+    basis_row = ordered.iloc[-7] if len(ordered) > 6 else ordered.iloc[0]
+    latest_price = float(latest["PRICE"]) if pd.notna(latest["PRICE"]) else None
+    latest_jeonse = float(latest["JEONSE_PRICE"]) if pd.notna(latest["JEONSE_PRICE"]) else None
+    latest_ratio = round(latest_jeonse / latest_price * 100, 1) if latest_price and latest_jeonse else None
+    price_change = _safe_pct_change(latest_price, float(basis_row["PRICE"]) if pd.notna(basis_row["PRICE"]) else None)
+    jeonse_change = _safe_pct_change(
+        latest_jeonse,
+        float(basis_row["JEONSE_PRICE"]) if pd.notna(basis_row["JEONSE_PRICE"]) else None,
+    )
+
+    return {
+        "latest_month": pd.to_datetime(latest["YYYYMMDD"]).strftime("%Y-%m"),
+        "latest_price": latest_price,
+        "latest_jeonse": latest_jeonse,
+        "latest_ratio": latest_ratio,
+        "price_change": price_change,
+        "jeonse_change": jeonse_change,
+        "history_points": int(len(ordered)),
+    }
+
+
+def build_market_flow_summary(selected_area: str, snapshot: dict[str, object]) -> str:
+    if not snapshot:
+        return f"{selected_area}의 최근 시세 요약을 만들 데이터가 아직 충분하지 않습니다."
+
+    price_text = _format_pct(snapshot.get("price_change"))
+    jeonse_text = _format_pct(snapshot.get("jeonse_change"))
+    ratio = snapshot.get("latest_ratio")
+    ratio_text = f"{ratio:.1f}%" if isinstance(ratio, (int, float)) else "-"
+
+    return (
+        f"{selected_area}의 최신 기준월은 {snapshot['latest_month']}이고, "
+        f"최근 흐름 기준 매매가는 {price_text}, 전세가는 {jeonse_text} 움직였습니다. "
+        f"현재 전세가율은 {ratio_text}입니다."
+    )
+
+
+def _extract_cortex_text(value: object) -> str:
+    if value is None:
+        return ""
+
+    text = str(value).strip()
+    if not text:
+        return ""
+
+    try:
+        payload = json.loads(text)
+    except Exception:
+        return text
+
+    if isinstance(payload, dict):
+        choices = payload.get("choices")
+        if isinstance(choices, list) and choices:
+            first = choices[0]
+            if isinstance(first, dict):
+                for key in ("messages", "message", "text", "content"):
+                    candidate = first.get(key)
+                    if isinstance(candidate, str) and candidate.strip():
+                        return candidate.strip()
+                    if isinstance(candidate, list):
+                        collected = []
+                        for item in candidate:
+                            if isinstance(item, str) and item.strip():
+                                collected.append(item.strip())
+                            elif isinstance(item, dict):
+                                text_value = item.get("text") or item.get("content")
+                                if isinstance(text_value, str) and text_value.strip():
+                                    collected.append(text_value.strip())
+                        if collected:
+                            return "\n".join(collected)
+        for key in ("text", "content", "response"):
+            candidate = payload.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+
+    return text
+
+
+@st.cache_data(show_spinner=False)
+def get_candidate_ai_summary(_session, prompt: str) -> str:
+    try:
+        result = _session.sql(
+            "SELECT SNOWFLAKE.CORTEX.TRY_COMPLETE('mistral-large2', ?)",
+            params=[prompt],
+        ).collect()
+    except Exception:
+        return ""
+
+    if not result:
+        return ""
+
+    return _extract_cortex_text(result[0][0])
+
+
+def build_candidate_ai_prompt(
+    selected_area: str,
+    grade_label: str,
+    candidate_row: pd.Series,
+    survey_result: dict[str, object],
+    history_snapshot: dict[str, object],
+) -> str:
+    return (
+        "당신은 전세 안전을 설명하는 부동산 데이터 분석가입니다. "
+        "아래 정보를 바탕으로 사용자의 질문 '이 동네 어떤가요?'에 답해주세요. "
+        "응답은 한국어 4문장 이내로 작성하고, 첫 문장은 한줄 총평, "
+        "다음 문장들은 근거와 주의할 점을 쉽게 설명하세요. 전문용어는 최소화하세요.\n\n"
+        f"동네: {selected_area}\n"
+        f"안전등급: {grade_label}\n"
+        f"전세가율: {candidate_row['JEONSE_RATE']:.1f}%\n"
+        f"예상 손실 노출: {format_currency_krw(candidate_row['LOSS_EXPOSURE_AMOUNT'])}\n"
+        f"추정 전세 총액: {format_currency_krw(candidate_row['ESTIMATED_TOTAL_JEONSE'])}\n"
+        f"전세가율 점수: {candidate_row['S_RATE']:.1f}/100\n"
+        f"거래활발도 점수: {candidate_row['S_MIG']:.1f}/100\n"
+        f"안정성 보조 점수: {candidate_row['S_SUB']:.1f}/100\n"
+        f"사용자 성향: {survey_result['profile']}\n"
+        f"최근 시장 요약: {build_market_flow_summary(selected_area, history_snapshot)}"
     )
 
 
@@ -369,7 +517,6 @@ inject_styles()
 
 session = get_snowpark_session()
 scores_df = load_scores(session)
-grade_df = load_grade_summary(session)
 all_area_history_df = load_all_area_history(session)
 
 if scores_df.empty:
@@ -519,6 +666,7 @@ filtered_df = recommendation_df[recommendation_df["FILTER_MATCH"]].copy()
 better_df = recommendation_df[recommendation_df["BETTER_ALTERNATIVE"]].copy()
 best_alternative = better_df.iloc[0] if not better_df.empty else None
 selected_history_df = get_area_history(all_area_history_df, candidate_row["SGG"], candidate_row["EMD"])
+market_snapshot = build_market_flow_snapshot(selected_history_df)
 
 # ── Profile + metrics ──
 st.markdown(_profile_card_html(survey_result["profile"]), unsafe_allow_html=True)
@@ -720,30 +868,15 @@ with tabs[1]:
         )
     with right:
         st.markdown("#### 이 동네는 어떤가요?")
-        # Cortex AI 자동 해설
-        cortex_prompt = (
-            f"당신은 전세 안전 전문가입니다. 아래 데이터를 보고, "
-            f"이 동네의 전세 안전성을 일반인이 이해할 수 있게 3~4문장으로 해설해주세요. "
-            f"전문 용어는 쓰지 마세요.\n\n"
-            f"동네: {selected_area}\n"
-            f"안전등급: {grade_label}\n"
-            f"전세가율: {candidate_row['JEONSE_RATE']:.1f}%\n"
-            f"추정 전세 총액: {format_currency_krw(candidate_row['ESTIMATED_TOTAL_JEONSE'])}\n"
-            f"예상 손실 노출: {format_currency_krw(candidate_row['LOSS_EXPOSURE_AMOUNT'])}\n"
-            f"전세가율 점수(100점 만점): {candidate_row['S_RATE']:.1f}\n"
-            f"전입전출 점수(100점 만점): {candidate_row['S_MIG']:.1f}\n"
-            f"지하철 접근성 점수(100점 만점): {candidate_row['S_SUB']:.1f}\n"
+        cortex_prompt = build_candidate_ai_prompt(
+            selected_area=selected_area,
+            grade_label=grade_label,
+            candidate_row=candidate_row,
+            survey_result=survey_result,
+            history_snapshot=market_snapshot,
         )
-        try:
-            cortex_result = session.sql(
-                "SELECT SNOWFLAKE.CORTEX.COMPLETE('mistral-large2', ?)",
-                params=[cortex_prompt],
-            ).collect()
-            ai_summary = cortex_result[0][0] if cortex_result else ""
-            st.write(ai_summary)
-        except Exception:
-            # Cortex 사용 불가 시 기본 해설
-            st.write(build_candidate_summary(candidate_row, survey_result))
+        ai_summary = get_candidate_ai_summary(session, cortex_prompt)
+        st.write(ai_summary or build_candidate_summary(candidate_row, survey_result))
 
         st.markdown("#### 상세 정보")
         st.dataframe(
@@ -842,23 +975,27 @@ with tabs[3]:
     if selected_history_df.empty:
         st.info("선택한 후보의 시세 데이터가 없습니다.")
     else:
+        metric_1, metric_2, metric_3, metric_4 = st.columns(4)
+        metric_1.metric("기준월", str(market_snapshot.get("latest_month", "-")))
+        metric_2.metric(
+            "매매가",
+            format_currency_krw(market_snapshot["latest_price"]) if market_snapshot.get("latest_price") else "-",
+            _format_pct(market_snapshot.get("price_change")),
+        )
+        metric_3.metric(
+            "전세가",
+            format_currency_krw(market_snapshot["latest_jeonse"]) if market_snapshot.get("latest_jeonse") else "-",
+            _format_pct(market_snapshot.get("jeonse_change")),
+        )
+        metric_4.metric(
+            "전세가율",
+            f"{market_snapshot['latest_ratio']:.1f}%" if market_snapshot.get("latest_ratio") else "-",
+            f"이력 {market_snapshot.get('history_points', 0)}건",
+        )
+
+        st.caption(build_market_flow_summary(selected_area, market_snapshot))
         st.markdown(f"**{selected_area}** 매매가·전세가 추이")
         st.altair_chart(make_history_chart(selected_history_df), use_container_width=True)
-
-    st.markdown("#### 서울 전체 안전등급 분포")
-    grade_chart_df = grade_df.copy()
-    grade_chart_df["등급설명"] = grade_chart_df["GRADE"].map(
-        {"A": "A (안전)", "B": "B (보통)", "C": "C (주의)", "D": "D (위험)"}
-    )
-    st.altair_chart(
-        alt.Chart(grade_chart_df).mark_bar(cornerRadiusTopLeft=8, cornerRadiusTopRight=8).encode(
-            x=alt.X("등급설명:N", sort=["A (안전)", "B (보통)", "C (주의)", "D (위험)"], title="안전등급"),
-            y=alt.Y("AREA_COUNT:Q", title="동네 수"),
-            color=alt.Color("GRADE:N", legend=None, sort=["A", "B", "C", "D"]),
-            tooltip=["등급설명", "AREA_COUNT"],
-        ),
-        use_container_width=True,
-    )
 
 # ── 안내 문구 ──
 st.divider()

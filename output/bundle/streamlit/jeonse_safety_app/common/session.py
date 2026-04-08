@@ -8,8 +8,8 @@ from snowflake.snowpark.context import get_active_session
 def _local_connection_config() -> Dict[str, Any]:
     if "snowflake" not in st.secrets:
         raise RuntimeError(
-            "Missing Streamlit secrets. Create .streamlit/secrets.toml "
-            "from .streamlit/secrets.toml.example before running locally."
+            "Missing Streamlit secrets. Create snowflake/.streamlit/secrets.toml "
+            "from secrets.toml.example before running locally."
         )
 
     snowflake_secrets = st.secrets["snowflake"]
