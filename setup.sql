@@ -248,88 +248,134 @@ WITH merged AS (
         ON t.SGG = r.SGG
        AND t.EMD = r.EMD
        AND t.YYYYMMDD = r.YYYYMMDD
+),
+-- SPH 데이터: 중구/영등포구/서초구만 제공 (구 단위 최신 월 집계)
+sph_asset AS (
+    SELECT
+        m.CITY_KOR_NAME AS SGG,
+        AVG(a.AVERAGE_ASSET_AMOUNT) AS AVG_ASSET,
+        AVG(a.AVERAGE_INCOME) AS AVG_INCOME,
+        AVG(a.AVERAGE_SCORE) AS AVG_CREDIT_SCORE,
+        AVG(a.AVERAGE_BALANCE_AMOUNT) AS AVG_LOAN
+    FROM SEOUL_DISTRICTLEVEL_DATA_FLOATING_POPULATION_CONSUMPTION_AND_ASSETS.GRANDATA.ASSET_INCOME_INFO a
+    JOIN SEOUL_DISTRICTLEVEL_DATA_FLOATING_POPULATION_CONSUMPTION_AND_ASSETS.GRANDATA.M_SCCO_MST m
+        ON a.DISTRICT_CODE = m.DISTRICT_CODE
+    WHERE a.STANDARD_YEAR_MONTH = (
+        SELECT MAX(STANDARD_YEAR_MONTH)
+        FROM SEOUL_DISTRICTLEVEL_DATA_FLOATING_POPULATION_CONSUMPTION_AND_ASSETS.GRANDATA.ASSET_INCOME_INFO
+    )
+    GROUP BY m.CITY_KOR_NAME
+),
+sph_pop AS (
+    SELECT
+        m.CITY_KOR_NAME AS SGG,
+        SUM(f.RESIDENTIAL_POPULATION) AS RES_POP,
+        SUM(f.WORKING_POPULATION) AS WORK_POP,
+        SUM(f.VISITING_POPULATION) AS VISIT_POP
+    FROM SEOUL_DISTRICTLEVEL_DATA_FLOATING_POPULATION_CONSUMPTION_AND_ASSETS.GRANDATA.FLOATING_POPULATION_INFO f
+    JOIN SEOUL_DISTRICTLEVEL_DATA_FLOATING_POPULATION_CONSUMPTION_AND_ASSETS.GRANDATA.M_SCCO_MST m
+        ON f.DISTRICT_CODE = m.DISTRICT_CODE
+    WHERE f.STANDARD_YEAR_MONTH = (
+        SELECT MAX(STANDARD_YEAR_MONTH)
+        FROM SEOUL_DISTRICTLEVEL_DATA_FLOATING_POPULATION_CONSUMPTION_AND_ASSETS.GRANDATA.FLOATING_POPULATION_INFO
+    )
+    GROUP BY m.CITY_KOR_NAME
 )
 SELECT
-    SGG,
-    EMD,
-    YYYYMMDD,
-    PRICE,
-    JEONSE_PRICE,
-    CAST(NULL AS FLOAT) AS AVG_ASSET,
-    CAST(NULL AS FLOAT) AS AVG_INCOME,
-    CAST(NULL AS FLOAT) AS AVG_CREDIT_SCORE,
-    CAST(NULL AS FLOAT) AS AVG_LOAN,
-    CAST(NULL AS FLOAT) AS RES_POP,
-    CAST(NULL AS FLOAT) AS WORK_POP,
-    CAST(NULL AS FLOAT) AS VISIT_POP
+    merged.SGG,
+    merged.EMD,
+    merged.YYYYMMDD,
+    merged.PRICE,
+    merged.JEONSE_PRICE,
+    sa.AVG_ASSET,
+    sa.AVG_INCOME,
+    sa.AVG_CREDIT_SCORE,
+    sa.AVG_LOAN,
+    sp.RES_POP,
+    sp.WORK_POP,
+    sp.VISIT_POP
 FROM merged
-WHERE SGG IS NOT NULL
-  AND EMD IS NOT NULL
-  AND (PRICE IS NOT NULL OR JEONSE_PRICE IS NOT NULL);
+LEFT JOIN sph_asset sa ON merged.SGG = sa.SGG
+LEFT JOIN sph_pop sp ON merged.SGG = sp.SGG
+WHERE merged.SGG IS NOT NULL
+  AND merged.EMD IS NOT NULL
+  AND (merged.PRICE IS NOT NULL OR merged.JEONSE_PRICE IS NOT NULL);
 
--- Notes on legacy column names:
---   NET_MIG     -> recent 6-month transaction count proxy
---   SUBWAY_DIST -> recent 12-month jeonse-rate volatility proxy
--- These names are kept so the existing app code can continue to query
--- the same columns without any frontend changes.
-CREATE OR REPLACE VIEW HACKATHON_APP.RESILIENCE.JEONSE_SAFETY_SCORE AS
-WITH monthly AS (
-    SELECT
-        base.SGG,
-        base.EMD,
-        base.YYYYMMDD,
-        base.PRICE,
-        base.JEONSE_PRICE,
-        COALESCE(trade.TRADE_COUNT, 0) AS TRADE_COUNT,
-        COALESCE(rent.RENT_COUNT, 0) AS RENT_COUNT,
+-- ============================================================
+-- Feature layer: FEATURE_AREA_MONTH
+-- 파이프라인: RAW → CLEAN → MONTHLY → FEATURE → SCORE → STREAMLIT
+-- 월별 시계열에 파생 지표(전세가율, 변동률, 거래량, 변동성)를 계산한다.
+-- ============================================================
+
+CREATE OR REPLACE VIEW HACKATHON_APP.RESILIENCE.FEATURE_AREA_MONTH AS
+SELECT
+    base.SGG,
+    base.EMD,
+    base.YYYYMMDD,
+    base.PRICE,
+    base.JEONSE_PRICE,
+    COALESCE(trade.TRADE_COUNT, 0) AS TRADE_COUNT,
+    COALESCE(rent.RENT_COUNT, 0) AS RENT_COUNT,
+    -- 전세가율
+    CASE
+        WHEN base.PRICE > 0 AND base.JEONSE_PRICE > 0
+            THEN ROUND(base.JEONSE_PRICE / base.PRICE * 100, 1)
+        ELSE NULL
+    END AS JEONSE_RATE,
+    -- 12개월 전 전세가 (변동률 계산용)
+    LAG(base.JEONSE_PRICE, 12) OVER (
+        PARTITION BY base.SGG, base.EMD
+        ORDER BY base.YYYYMMDD
+    ) AS JEONSE_PRICE_12M_AGO,
+    -- 최근 6개월 거래 건수 (거래 활발도)
+    SUM(COALESCE(trade.TRADE_COUNT, 0) + COALESCE(rent.RENT_COUNT, 0)) OVER (
+        PARTITION BY base.SGG, base.EMD
+        ORDER BY base.YYYYMMDD
+        ROWS BETWEEN 5 PRECEDING AND CURRENT ROW
+    ) AS RECENT_TX_COUNT,
+    -- 12개월 전세가율 변동성 (가격 안정성)
+    STDDEV_POP(
         CASE
             WHEN base.PRICE > 0 AND base.JEONSE_PRICE > 0
                 THEN base.JEONSE_PRICE / base.PRICE * 100
             ELSE NULL
-        END AS JEONSE_RATE,
-        LAG(base.JEONSE_PRICE, 12) OVER (
-            PARTITION BY base.SGG, base.EMD
-            ORDER BY base.YYYYMMDD
-        ) AS JEONSE_PRICE_12M_AGO,
-        SUM(COALESCE(trade.TRADE_COUNT, 0) + COALESCE(rent.RENT_COUNT, 0)) OVER (
-            PARTITION BY base.SGG, base.EMD
-            ORDER BY base.YYYYMMDD
-            ROWS BETWEEN 5 PRECEDING AND CURRENT ROW
-        ) AS RECENT_TX_COUNT,
-        STDDEV_POP(
-            CASE
-                WHEN base.PRICE > 0 AND base.JEONSE_PRICE > 0
-                    THEN base.JEONSE_PRICE / base.PRICE * 100
-                ELSE NULL
-            END
-        ) OVER (
-            PARTITION BY base.SGG, base.EMD
-            ORDER BY base.YYYYMMDD
-            ROWS BETWEEN 11 PRECEDING AND CURRENT ROW
-        ) AS RATE_VOLATILITY,
-        ROW_NUMBER() OVER (
-            PARTITION BY base.SGG, base.EMD
-            ORDER BY base.YYYYMMDD DESC
-        ) AS RN
-    FROM HACKATHON_APP.RESILIENCE.RESILIENCE_BASE base
-    LEFT JOIN HACKATHON_APP.RESILIENCE.MOLIT_APT_TRADE_MONTHLY trade
-        ON base.SGG = trade.SGG
-       AND base.EMD = trade.EMD
-       AND base.YYYYMMDD = trade.YYYYMMDD
-    LEFT JOIN HACKATHON_APP.RESILIENCE.MOLIT_APT_RENT_MONTHLY rent
-        ON base.SGG = rent.SGG
-       AND base.EMD = rent.EMD
-       AND base.YYYYMMDD = rent.YYYYMMDD
-    WHERE base.PRICE IS NOT NULL
-      AND base.JEONSE_PRICE IS NOT NULL
-),
-latest AS (
+        END
+    ) OVER (
+        PARTITION BY base.SGG, base.EMD
+        ORDER BY base.YYYYMMDD
+        ROWS BETWEEN 11 PRECEDING AND CURRENT ROW
+    ) AS RATE_VOLATILITY,
+    -- 최신 행 식별용
+    ROW_NUMBER() OVER (
+        PARTITION BY base.SGG, base.EMD
+        ORDER BY base.YYYYMMDD DESC
+    ) AS RN
+FROM HACKATHON_APP.RESILIENCE.RESILIENCE_BASE base
+LEFT JOIN HACKATHON_APP.RESILIENCE.MOLIT_APT_TRADE_MONTHLY trade
+    ON base.SGG = trade.SGG
+   AND base.EMD = trade.EMD
+   AND base.YYYYMMDD = trade.YYYYMMDD
+LEFT JOIN HACKATHON_APP.RESILIENCE.MOLIT_APT_RENT_MONTHLY rent
+    ON base.SGG = rent.SGG
+   AND base.EMD = rent.EMD
+   AND base.YYYYMMDD = rent.YYYYMMDD
+WHERE base.PRICE IS NOT NULL
+  AND base.JEONSE_PRICE IS NOT NULL;
+
+-- ============================================================
+-- Scoring layer: JEONSE_SAFETY_SCORE
+-- FEATURE_AREA_MONTH의 최신 행을 읽어 백분위 점수 + 등급을 산출한다.
+-- 컬럼명 NET_MIG, SUBWAY_DIST는 앱 호환용 alias.
+-- ============================================================
+
+CREATE OR REPLACE VIEW HACKATHON_APP.RESILIENCE.JEONSE_SAFETY_SCORE AS
+WITH latest AS (
     SELECT
         SGG,
         EMD,
         ROUND(PRICE, 0) AS MEME_LATEST,
         ROUND(JEONSE_PRICE, 0) AS JEONSE_LATEST,
-        ROUND(JEONSE_RATE, 1) AS JEONSE_RATE,
+        JEONSE_RATE,
         ROUND(
             COALESCE(
                 (JEONSE_PRICE - JEONSE_PRICE_12M_AGO)
@@ -340,8 +386,9 @@ latest AS (
         ) AS JEONSE_DROP_PCT,
         COALESCE(RECENT_TX_COUNT, 0) AS NET_MIG,
         COALESCE(RATE_VOLATILITY, 0) AS SUBWAY_DIST
-    FROM monthly
+    FROM HACKATHON_APP.RESILIENCE.FEATURE_AREA_MONTH
     WHERE RN = 1
+      AND (JEONSE_RATE IS NULL OR (JEONSE_RATE > 0 AND JEONSE_RATE <= 100))
 ),
 scored AS (
     SELECT
@@ -358,12 +405,15 @@ scored AS (
             ) * 100,
             1
         ) AS S_MIG,
-        ROUND(
-            PERCENT_RANK() OVER (
-                ORDER BY COALESCE(SUBWAY_DIST, 999999) DESC
-            ) * 100,
-            1
-        ) AS S_SUB
+        CASE
+            WHEN NET_MIG < 10 THEN 50.0
+            ELSE ROUND(
+                PERCENT_RANK() OVER (
+                    ORDER BY COALESCE(SUBWAY_DIST, 999999) DESC
+                ) * 100,
+                1
+            )
+        END AS S_SUB
     FROM latest
 ),
 hug AS (
@@ -393,6 +443,92 @@ SELECT
 FROM scored
 LEFT JOIN hug
     ON scored.SGG = hug.GU_NAME;
+
+-- ============================================================
+-- ML Feature table: ML_TRAIN_FEATURES
+-- 각 동/월에 대해 "6개월 후 전세가 하락 여부"를 타겟으로 하는
+-- 학습 데이터셋을 생성한다.
+-- ============================================================
+
+CREATE OR REPLACE VIEW HACKATHON_APP.RESILIENCE.ML_TRAIN_FEATURES AS
+WITH feat AS (
+    SELECT
+        SGG,
+        EMD,
+        YYYYMMDD,
+        PRICE,
+        JEONSE_PRICE,
+        JEONSE_RATE,
+        TRADE_COUNT,
+        RENT_COUNT,
+        RECENT_TX_COUNT,
+        RATE_VOLATILITY,
+        -- 전세가 변동률 (12개월)
+        CASE
+            WHEN JEONSE_PRICE_12M_AGO > 0
+                THEN (JEONSE_PRICE - JEONSE_PRICE_12M_AGO) / JEONSE_PRICE_12M_AGO * 100
+            ELSE 0
+        END AS JEONSE_CHANGE_12M_PCT,
+        -- 매매 대비 전세 쿠션
+        CASE
+            WHEN PRICE > 0
+                THEN (PRICE - JEONSE_PRICE) / PRICE * 100
+            ELSE 0
+        END AS SALE_CUSHION_PCT,
+        -- 전세 비중 (전세 / 전체 임대)
+        CASE
+            WHEN RENT_COUNT > 0
+                THEN TRADE_COUNT * 1.0 / (TRADE_COUNT + RENT_COUNT) * 100
+            ELSE 50
+        END AS TRADE_RATIO_PCT,
+        -- 6개월 후 전세가 (타겟 생성용)
+        LEAD(JEONSE_PRICE, 6) OVER (
+            PARTITION BY SGG, EMD ORDER BY YYYYMMDD
+        ) AS JEONSE_PRICE_6M_LATER
+    FROM HACKATHON_APP.RESILIENCE.FEATURE_AREA_MONTH
+    WHERE JEONSE_RATE IS NOT NULL
+      AND JEONSE_RATE > 0
+      AND JEONSE_RATE <= 100
+)
+SELECT
+    SGG,
+    EMD,
+    YYYYMMDD,
+    -- Features
+    JEONSE_RATE,
+    SALE_CUSHION_PCT,
+    RATE_VOLATILITY,
+    JEONSE_CHANGE_12M_PCT,
+    RECENT_TX_COUNT,
+    TRADE_COUNT,
+    RENT_COUNT,
+    TRADE_RATIO_PCT,
+    -- Target: 6개월 후 전세가가 5% 이상 하락했는지
+    CASE
+        WHEN JEONSE_PRICE_6M_LATER IS NOT NULL
+             AND JEONSE_PRICE > 0
+             AND (JEONSE_PRICE_6M_LATER - JEONSE_PRICE) / JEONSE_PRICE * 100 <= -5
+        THEN 1
+        ELSE 0
+    END AS DROP_RISK_LABEL,
+    -- 연속 타겟: 6개월 후 변동률
+    CASE
+        WHEN JEONSE_PRICE_6M_LATER IS NOT NULL AND JEONSE_PRICE > 0
+            THEN ROUND((JEONSE_PRICE_6M_LATER - JEONSE_PRICE) / JEONSE_PRICE * 100, 2)
+        ELSE NULL
+    END AS JEONSE_CHANGE_6M_PCT
+FROM feat
+WHERE JEONSE_PRICE_6M_LATER IS NOT NULL;
+
+-- ML 추론 결과 저장 테이블
+CREATE TABLE IF NOT EXISTS HACKATHON_APP.RESILIENCE.ML_RISK_SCORES (
+    SGG          VARCHAR(50),
+    EMD          VARCHAR(100),
+    ML_RISK_SCORE FLOAT,
+    ML_DROP_PROB  FLOAT,
+    SCORED_AT    TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    MODEL_VERSION VARCHAR(50)
+);
 
 -- ============================================================
 -- Quick checks

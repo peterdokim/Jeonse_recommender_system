@@ -7,8 +7,8 @@ import streamlit as st
 
 DIMENSION_LABELS = {
     "S_RATE": "전세가율",
-    "S_MIG": "전입전출",
-    "S_SUB": "지하철",
+    "S_MIG": "거래 활발도",
+    "S_SUB": "가격 안정성",
 }
 
 GRADE_MEANINGS = {
@@ -108,7 +108,21 @@ def from_eok(value: float) -> int:
 
 
 def format_currency_krw(value: float) -> str:
-    return f"{value:,.0f}원"
+    """금액을 억/만원 단위로 자연스럽게 표시한다."""
+    value = float(value)
+    abs_val = abs(value)
+    sign = "-" if value < 0 else ""
+    if abs_val >= 100_000_000:
+        eok = abs_val / 100_000_000
+        if eok == int(eok):
+            return f"{sign}{int(eok)}억원"
+        return f"{sign}{eok:.1f}억원"
+    if abs_val >= 10_000:
+        man = abs_val / 10_000
+        if man == int(man):
+            return f"{sign}{int(man)}만원"
+        return f"{sign}{man:.0f}만원"
+    return f"{sign}{abs_val:,.0f}원"
 
 
 def percentile_score(series: pd.Series, higher_is_better: bool = True, fill_value: float = 50.0) -> pd.Series:
@@ -357,17 +371,25 @@ def build_recommendation_dataset(
         price_similarity * 0.50 + rate_similarity * 0.30 + area_similarity * 0.20
     ).round(1)
 
-    # 보증금 이하 + 허용 범위만큼 위까지 포함
-    # 예: 보증금 5억, 허용 10% → 0원 ~ 5.5억까지 매칭
+    # ── Hard Filter ──
+
+    # 1. 예산: 보증금 이하 + 허용 범위만큼 위까지 포함
     upper_budget = deposit_amount * (1 + budget_tolerance_pct / 100)
     df["BUDGET_BAND_MATCH"] = df["ESTIMATED_TOTAL_JEONSE"] <= upper_budget
 
+    # 2. 지역 범위
     if search_scope == "현재 관심 구 우선":
         df["AREA_SCOPE_MATCH"] = df["SGG"] == candidate_sgg
     elif search_scope == "출퇴근권 우선":
         df["AREA_SCOPE_MATCH"] = df["SGG"].isin([candidate_sgg, workplace_sgg])
     else:
         df["AREA_SCOPE_MATCH"] = True
+
+    # 3. 실거래 존재 여부: 최근 6개월 거래 5건 미만이면 데이터 부족으로 제외
+    df["HAS_ENOUGH_TX"] = df["NET_MIG"].fillna(0) >= 5
+
+    # 4. 절대 위험 제외: 전세가율 90% 이상은 성향 무관하게 제외
+    df["NOT_ABSOLUTE_RISK"] = df["JEONSE_RATE"].fillna(0) < 90
 
     convenience_weight = 0.35 + float(survey_result["convenience_preference"]) / 100 * 0.30
     lifestyle_weight = 1 - convenience_weight
@@ -380,14 +402,23 @@ def build_recommendation_dataset(
         + df["LIFESTYLE_FIT_SCORE"] * lifestyle_weight
     ).round(1)
 
-    # README 수식과 일치:
-    # 추천점수 = 안전점수 - α*손실패널티 - β*가격과열패널티 + γ*선호적합도 + δ*유사도
+    # 하이브리드 추천점수: 룰 기반(80%) + ML 위험 예측(20%)
+    # 룰 기반: 안전점수 - 손실패널티 - 과열패널티 + 선호적합도 + 유사도
+    rule_score = (
+        df["SAFETY_SCORE"] * 0.50
+        - df["LOSS_PENALTY_SCORE"] * 0.15 * alpha
+        - df["PRICE_OVERHEAT_PENALTY_SCORE"] * 0.10 * beta
+        + df["PREFERENCE_FIT_SCORE"] * 0.15 * gamma
+        + df["SIMILARITY_SCORE"] * 0.10 * delta
+    ).clip(0, 100)
+
+    # ML: ML_RISK_SCORE가 높을수록 위험 → (100 - ML_RISK_SCORE)가 안전 점수
+    ml_safety = (100 - df["ML_RISK_SCORE"].fillna(50)).clip(0, 100)
+
+    df["RULE_SCORE"] = rule_score.round(1)
+    df["ML_SAFETY_SCORE"] = ml_safety.round(1)
     df["RECOMMENDATION_SCORE"] = (
-        df["SAFETY_SCORE"]
-        - df["LOSS_PENALTY_SCORE"] * alpha
-        - df["PRICE_OVERHEAT_PENALTY_SCORE"] * beta
-        + df["PREFERENCE_FIT_SCORE"] * gamma
-        + df["SIMILARITY_SCORE"] * delta
+        rule_score * 0.80 + ml_safety * 0.20
     ).clip(0, 100).round(1)
 
     df["PROFILE"] = survey_result["profile"]
@@ -397,7 +428,12 @@ def build_recommendation_dataset(
     df["DELTA"] = delta
 
     df["IS_CANDIDATE"] = candidate_mask
-    df["FILTER_MATCH"] = df["IS_CANDIDATE"] | (df["BUDGET_BAND_MATCH"] & df["AREA_SCOPE_MATCH"])
+    df["FILTER_MATCH"] = df["IS_CANDIDATE"] | (
+        df["BUDGET_BAND_MATCH"]
+        & df["AREA_SCOPE_MATCH"]
+        & df["HAS_ENOUGH_TX"]
+        & df["NOT_ABSOLUTE_RISK"]
+    )
 
     sorted_df = df.sort_values(
         ["FILTER_MATCH", "RECOMMENDATION_SCORE", "SAFETY_SCORE", "BACKTEST_SCORE"],
@@ -567,6 +603,12 @@ def build_exclusion_reasons(row: pd.Series, candidate_row: pd.Series) -> List[st
 
     if not row.get("AREA_SCOPE_MATCH", True):
         reasons.append("설정한 탐색 범위(구/생활권) 밖")
+
+    if not row.get("HAS_ENOUGH_TX", True):
+        reasons.append(f"최근 거래가 {int(row.get('NET_MIG', 0))}건으로 데이터가 부족함")
+
+    if not row.get("NOT_ABSOLUTE_RISK", True):
+        reasons.append(f"전세가율 {row.get('JEONSE_RATE', 0):.1f}%로 절대 위험 기준 초과")
 
     # 안전 등급
     cand_grade = str(candidate_row.get("GRADE", ""))

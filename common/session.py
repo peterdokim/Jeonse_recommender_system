@@ -27,18 +27,31 @@ def _local_connection_config() -> Dict[str, Any]:
     return config
 
 
+def _create_local_session() -> Session:
+    config = _local_connection_config()
+    session = Session.builder.configs(config).create()
+    if "role" in config:
+        session.sql(f'USE ROLE "{config["role"]}"').collect()
+    session.sql(f'USE WAREHOUSE "{config["warehouse"]}"').collect()
+    session.sql(f'USE DATABASE "{config["database"]}"').collect()
+    session.sql(f'USE SCHEMA "{config["schema"]}"').collect()
+    return session
+
+
 @st.cache_resource(show_spinner=False)
 def get_snowpark_session() -> Session:
     try:
         return get_active_session()
     except Exception:
-        config = _local_connection_config()
-        session = Session.builder.configs(config).create()
+        return _create_local_session()
 
-        if "role" in config:
-            session.sql(f'USE ROLE "{config["role"]}"').collect()
-        session.sql(f'USE WAREHOUSE "{config["warehouse"]}"').collect()
-        session.sql(f'USE DATABASE "{config["database"]}"').collect()
-        session.sql(f'USE SCHEMA "{config["schema"]}"').collect()
 
+def get_safe_session() -> Session:
+    """만료된 세션을 감지하고 자동 재연결한다."""
+    session = get_snowpark_session()
+    try:
+        session.sql("SELECT 1").collect()
         return session
+    except Exception:
+        st.cache_resource.clear()
+        return get_snowpark_session()

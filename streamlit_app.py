@@ -4,7 +4,7 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 
-from common.queries import load_all_area_history, load_scores
+from common.queries import load_all_area_history, load_complex_summary, load_recent_transactions, load_scores
 from common.recommendation import (
     DIMENSION_LABELS,
     GRADE_MEANINGS,
@@ -23,7 +23,7 @@ from common.recommendation import (
     get_area_history,
     to_eok,
 )
-from common.session import get_snowpark_session
+from common.session import get_safe_session
 
 st.set_page_config(
     page_title="전세 안심 추천",
@@ -205,8 +205,8 @@ def build_candidate_ai_prompt(
 def init_state() -> None:
     if "deposit_amount" not in st.session_state:
         st.session_state["deposit_amount"] = 500_000_000
-    if "deposit_slider_eok" not in st.session_state:
-        st.session_state["deposit_slider_eok"] = to_eok(st.session_state["deposit_amount"])
+    if "deposit_input_eok" not in st.session_state:
+        st.session_state["deposit_input_eok"] = to_eok(st.session_state["deposit_amount"])
     if "survey_completed" not in st.session_state:
         st.session_state["survey_completed"] = False
     if "conditions_confirmed" not in st.session_state:
@@ -222,15 +222,6 @@ def init_state() -> None:
 _MAX_DEPOSIT_EOK = 30.0  # 최대 30억
 
 
-def sync_deposit_from_slider() -> None:
-    st.session_state["deposit_amount"] = from_eok(st.session_state["deposit_slider_eok"])
-
-
-def sync_slider_from_input() -> None:
-    # 직접 입력이 슬라이더 범위를 넘지 않도록 클램핑
-    eok = to_eok(st.session_state["deposit_amount"])
-    st.session_state["deposit_slider_eok"] = min(eok, _MAX_DEPOSIT_EOK)
-    st.session_state["deposit_amount"] = from_eok(st.session_state["deposit_slider_eok"])
 
 
 def get_survey_answers() -> dict[str, int]:
@@ -484,6 +475,21 @@ def inject_styles() -> None:
             font-size: 0.9rem;
         }
 
+        /* Form submit 안내 메시지 + Enter to apply 숨김 */
+        [data-testid="InputInstructions"],
+        [data-testid="stFormSubmitButton"] + div,
+        .stForm [data-testid="InputInstructions"],
+        .stNumberInput [data-testid="InputInstructions"],
+        [data-testid="stNumberInput"] [data-testid="InputInstructions"] {
+            display: none !important;
+        }
+
+        /* number_input 영어 에러 메시지 숨김 (한국어로 대체) */
+        [data-testid="stNumberInput"] .stAlert,
+        .stNumberInput [data-baseweb="notification"] {
+            display: none !important;
+        }
+
         </style>
         """,
         unsafe_allow_html=True,
@@ -501,11 +507,13 @@ def make_history_chart(history_df: pd.DataFrame) -> alt.Chart:
         value_name="price",
     )
     long_df["series"] = long_df["series"].map({"PRICE": "매매가", "JEONSE_PRICE": "전세가"})
+    long_df["YYYYMMDD"] = pd.to_datetime(long_df["YYYYMMDD"])
+    long_df["월"] = long_df["YYYYMMDD"].dt.strftime("%Y년 %m월")
     return alt.Chart(long_df).mark_line(point=True).encode(
-        x=alt.X("YYYYMMDD:T", title="월"),
-        y=alt.Y("price:Q", title="평당 가격"),
-        color=alt.Color("series:N", title="시계열"),
-        tooltip=["YYYYMMDD:T", "series:N", alt.Tooltip("price:Q", format=",.0f")],
+        x=alt.X("YYYYMMDD:T", title="기간", axis=alt.Axis(format="%Y-%m")),
+        y=alt.Y("price:Q", title="평당가 (만원)"),
+        color=alt.Color("series:N", title="구분"),
+        tooltip=["월:N", "series:N", alt.Tooltip("price:Q", format=",.0f", title="만원")],
     )
 
 
@@ -515,7 +523,7 @@ def make_history_chart(history_df: pd.DataFrame) -> alt.Chart:
 init_state()
 inject_styles()
 
-session = get_snowpark_session()
+session = get_safe_session()
 scores_df = load_scores(session)
 all_area_history_df = load_all_area_history(session)
 
@@ -567,14 +575,16 @@ if not st.session_state.get("conditions_confirmed"):
 
     col3, col4 = st.columns(2)
     with col3:
-        st.number_input(
-            "보증금 (원)",
-            min_value=0,
-            max_value=from_eok(_MAX_DEPOSIT_EOK),
-            step=10_000_000,
-            value=200_000_000,
-            key="setup_deposit",
+        _setup_dep = st.number_input(
+            "보증금 (억원)",
+            min_value=0.0,
+            step=0.1,
+            value=2.0,
+            format="%.1f",
+            key="setup_deposit_eok",
         )
+        if _setup_dep > _MAX_DEPOSIT_EOK:
+            st.warning(f"최대 {_MAX_DEPOSIT_EOK:.0f}억원까지 입력 가능합니다.")
     with col4:
         workplace_sgg = st.selectbox("주요 생활권 / 출근 구", sgg_options, index=min(1, len(sgg_options) - 1), key="setup_workplace")
 
@@ -588,8 +598,8 @@ if not st.session_state.get("conditions_confirmed"):
 
     st.markdown("")
     if st.button("추천 결과 보기", type="primary", use_container_width=True):
-        st.session_state["deposit_amount"] = st.session_state["setup_deposit"]
-        st.session_state["deposit_slider_eok"] = to_eok(st.session_state["setup_deposit"])
+        st.session_state["deposit_amount"] = from_eok(min(st.session_state["setup_deposit_eok"], _MAX_DEPOSIT_EOK))
+        st.session_state["deposit_input_eok"] = st.session_state["setup_deposit_eok"]
         st.session_state["confirmed_sgg"] = st.session_state["setup_sgg"]
         st.session_state["confirmed_emd"] = st.session_state["setup_emd"]
         st.session_state["confirmed_workplace"] = st.session_state["setup_workplace"]
@@ -600,37 +610,40 @@ if not st.session_state.get("conditions_confirmed"):
         st.rerun()
 
     st.markdown("")
-    if st.button("설문 다시 하기"):
+    if st.button(":material/refresh: 설문 다시 하기"):
         reset_survey()
         st.rerun()
     st.stop()
 
 # ── Step 3: 결과 ──
-st.sidebar.title("추천 조건")
-selected_sgg = st.sidebar.selectbox("현재 관심 구", sgg_options, index=sgg_options.index(st.session_state.get("confirmed_sgg", sgg_options[0])))
-emd_options = sorted(scores_df.loc[scores_df["SGG"] == selected_sgg, "EMD"].dropna().unique().tolist())
-_default_emd = st.session_state.get("confirmed_emd", emd_options[0])
-selected_emd = st.sidebar.selectbox("현재 관심 동", emd_options, index=emd_options.index(_default_emd) if _default_emd in emd_options else 0)
-st.sidebar.slider(
-    "보증금 (억원)",
-    min_value=0.0,
-    max_value=_MAX_DEPOSIT_EOK,
-    step=0.5,
-    key="deposit_slider_eok",
-    on_change=sync_deposit_from_slider,
-)
-st.sidebar.number_input(
-    "보증금 직접 입력 (원)",
-    min_value=0,
-    max_value=from_eok(_MAX_DEPOSIT_EOK),
-    step=10_000_000,
-    key="deposit_amount",
-    on_change=sync_slider_from_input,
-)
-workplace_sgg = st.sidebar.selectbox("주요 생활권 / 출근 구", sgg_options, index=sgg_options.index(st.session_state.get("confirmed_workplace", sgg_options[min(1, len(sgg_options) - 1)])))
-preferred_pyeong = st.sidebar.slider("희망 평형 (평)", 10, 40, st.session_state.get("confirmed_pyeong", 24), 1)
-search_scope = st.sidebar.selectbox("탐색 범위", SEARCH_SCOPE_OPTIONS, index=SEARCH_SCOPE_OPTIONS.index(st.session_state.get("confirmed_scope", SEARCH_SCOPE_OPTIONS[1])))
-budget_tolerance_pct = st.sidebar.slider("예산 허용 범위 (±%)", 5, 20, st.session_state.get("confirmed_budget", 10), 1)
+with st.sidebar.form("sidebar_conditions"):
+    st.title("추천 조건")
+    selected_sgg = st.selectbox("현재 관심 구", sgg_options, index=sgg_options.index(st.session_state.get("confirmed_sgg", sgg_options[0])))
+    emd_options = sorted(scores_df.loc[scores_df["SGG"] == selected_sgg, "EMD"].dropna().unique().tolist())
+    _default_emd = st.session_state.get("confirmed_emd", emd_options[0])
+    selected_emd = st.selectbox("현재 관심 동", emd_options, index=emd_options.index(_default_emd) if _default_emd in emd_options else 0)
+    deposit_input = st.number_input(
+        "보증금 (억원)",
+        min_value=0.0,
+        step=0.1,
+        value=st.session_state.get("deposit_input_eok", to_eok(st.session_state["deposit_amount"])),
+        format="%.1f",
+    )
+    if deposit_input > _MAX_DEPOSIT_EOK:
+        deposit_input = _MAX_DEPOSIT_EOK
+        st.warning(f"최대 {_MAX_DEPOSIT_EOK:.0f}억원까지 입력 가능합니다.")
+    workplace_sgg = st.selectbox("주요 생활권 / 출근 구", sgg_options, index=sgg_options.index(st.session_state.get("confirmed_workplace", sgg_options[min(1, len(sgg_options) - 1)])))
+    preferred_pyeong = st.slider("희망 평형 (평)", 10, 40, st.session_state.get("confirmed_pyeong", 24), 1)
+    search_scope = st.selectbox("탐색 범위", SEARCH_SCOPE_OPTIONS, index=SEARCH_SCOPE_OPTIONS.index(st.session_state.get("confirmed_scope", SEARCH_SCOPE_OPTIONS[1])))
+    budget_tolerance_pct = st.slider("예산 허용 범위 (±%)", 5, 20, st.session_state.get("confirmed_budget", 10), 1)
+
+    sidebar_submitted = st.form_submit_button("조건 적용", type="primary", use_container_width=True)
+
+if sidebar_submitted:
+    st.session_state["deposit_amount"] = from_eok(deposit_input)
+    st.session_state["deposit_input_eok"] = deposit_input
+    st.session_state["confirmed_sgg"] = selected_sgg
+    st.session_state["confirmed_emd"] = selected_emd
 
 survey_answers = get_survey_answers()
 survey_result = classify_survey_profile(survey_answers)
@@ -642,12 +655,26 @@ st.sidebar.markdown(
     unsafe_allow_html=True,
 )
 st.sidebar.caption(survey_result["description"])
-if st.sidebar.button("성향 다시 측정", use_container_width=True):
+if st.sidebar.button(":material/refresh: 성향 다시 측정", use_container_width=True):
     reset_survey()
     st.rerun()
 
 deposit_amount = st.session_state["deposit_amount"]
 selected_area = f"{selected_sgg} {selected_emd}"
+
+# 페이지 중앙 로딩 스피너
+_loading_ph = st.empty()
+_loading_ph.markdown(
+    """
+    <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:50vh">
+        <style>@keyframes _spin{0%{transform:rotate(0deg)}100%{transform:rotate(360deg)}}</style>
+        <div style="width:48px;height:48px;border-radius:50%;border:4px solid #e0e0e0;
+             border-top-color:#2d7a52;animation:_spin .8s linear infinite"></div>
+        <p style="margin-top:14px;color:#888;font-size:0.9rem">추천 결과를 계산하고 있습니다...</p>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
 recommendation_df = build_recommendation_dataset(
     scores_df=scores_df,
@@ -668,8 +695,51 @@ best_alternative = better_df.iloc[0] if not better_df.empty else None
 selected_history_df = get_area_history(all_area_history_df, candidate_row["SGG"], candidate_row["EMD"])
 market_snapshot = build_market_flow_snapshot(selected_history_df)
 
+# 계산 완료 → 스피너 제거
+_loading_ph.empty()
+
 # ── Profile + metrics ──
 st.markdown(_profile_card_html(survey_result["profile"]), unsafe_allow_html=True)
+
+# 데이터 활용 안내 (SPH 3개 구 여부)
+_SPH_DISTRICTS = {"중구", "영등포구", "서초구"}
+_has_sph = selected_sgg in _SPH_DISTRICTS
+if _has_sph:
+    st.markdown(
+        f'{_icon("verified", 16, "#2d7a52")} '
+        f'<span style="font-size:0.82rem;color:#2d7a52">'
+        f'{selected_sgg}는 인구·소득·신용 데이터가 추가 반영되어 더 정밀한 추천이 제공됩니다.</span>',
+        unsafe_allow_html=True,
+    )
+else:
+    st.markdown(
+        f'{_icon("info", 16, "#999")} '
+        f'<span style="font-size:0.82rem;color:#999">'
+        f'{selected_sgg}는 거래·가격 데이터 기반으로 추천합니다. '
+        f'중구·영등포구·서초구는 인구·소득 데이터가 추가 반영됩니다.</span>',
+        unsafe_allow_html=True,
+    )
+
+# 3개 점수 분리 표시: 룰 기반 / AI 예측 / 최종 하이브리드
+score_1, score_2, score_3 = st.columns(3)
+score_1.metric(
+    "룰 기반 안전점수",
+    f"{candidate_row.get('RULE_SCORE', candidate_row['RECOMMENDATION_SCORE']):.1f}점",
+    help="전세가율, 거래량, 가격안정성 등 공식 기반 점수",
+)
+_ml_risk = candidate_row.get('ML_RISK_SCORE', 50)
+score_2.metric(
+    "AI 하락 위험도",
+    f"{_ml_risk:.0f}%",
+    delta=f"{'낮음' if _ml_risk < 30 else '보통' if _ml_risk < 60 else '높음'}",
+    delta_color="inverse",
+    help="6개월 내 전세가 5% 이상 하락할 확률 (ML 예측)",
+)
+score_3.metric(
+    "최종 추천점수",
+    f"{candidate_row['RECOMMENDATION_SCORE']:.1f}점",
+    help="룰 기반 80% + AI 예측 20% 하이브리드",
+)
 
 hero_1, hero_2, hero_3, hero_4 = st.columns(4)
 hero_1.metric("분류 성향", survey_result["profile"])
@@ -688,8 +758,6 @@ with summary_left:
             <div class="s-card-value">{selected_area}</div>
             <div class="s-card-body">
                 <span class="s-card-pill">등급 {candidate_row['GRADE']} · {GRADE_MEANINGS[candidate_row['GRADE']]}</span><br><br>
-                공통 안전점수 {candidate_row['SAFETY_SCORE']:.1f}점<br>
-                최종 추천점수 {candidate_row['RECOMMENDATION_SCORE']:.1f}점<br>
                 추정 전세 총액 {format_currency_krw(candidate_row['ESTIMATED_TOTAL_JEONSE'])}<br>
                 예상 손실 노출 {format_currency_krw(candidate_row['LOSS_EXPOSURE_AMOUNT'])}
             </div>
@@ -893,6 +961,104 @@ with tabs[1]:
             hide_index=True,
         )
 
+    # ── 위기 시뮬레이션 ──
+    st.markdown('<div class="section-gap"></div>', unsafe_allow_html=True)
+    st.markdown(
+        f'<div style="display:flex;align-items:center;gap:6px;margin-bottom:0.3rem">'
+        f'{_icon("trending_down", 22, "#e65100")}'
+        f'<span style="font-size:1.05rem;font-weight:700;color:#1a1a1a">전세가 하락 시뮬레이션</span>'
+        f"</div>"
+        f'<p style="color:#666;font-size:0.85rem;margin:0 0 0.3rem;line-height:1.6">'
+        f"만약 이 동네 전세가가 떨어지면, 계약 만기 때 보증금을 전액 돌려받지 못할 수 있습니다.<br>"
+        f"아래는 하락폭별로 <b>돌려받지 못할 수 있는 금액</b>을 계산한 것입니다.</p>",
+        unsafe_allow_html=True,
+    )
+
+    _total_jeonse = float(candidate_row["ESTIMATED_TOTAL_JEONSE"])
+    _jeonse_rate = float(candidate_row["JEONSE_RATE"])
+
+    # 시뮬레이션 기준: 보증금과 추정 전세 중 작은 값 (실제 계약 기준)
+    _sim_deposit = min(deposit_amount, _total_jeonse)
+
+    if deposit_amount > _total_jeonse:
+        st.markdown(
+            f'<p style="color:#2d7a52;font-size:0.85rem;margin:0 0 0.5rem">'
+            f'{_icon("check_circle", 16, "#2d7a52")} '
+            f'내 보증금({format_currency_krw(deposit_amount)})이 이 동네 추정 전세({format_currency_krw(_total_jeonse)})보다 높아, '
+            f'추정 전세 기준으로 시뮬레이션합니다.</p>',
+            unsafe_allow_html=True,
+        )
+
+    sim_scenarios = [5, 10, 15, 20, 30]
+
+    sim_cols = st.columns(len(sim_scenarios))
+    for i, col in enumerate(sim_cols):
+        drop_pct = sim_scenarios[i]
+        new_jeonse = _total_jeonse * (1 - drop_pct / 100)
+        loss_val = max(0, _sim_deposit - new_jeonse)
+        recovery_rate = min(100, new_jeonse / max(_sim_deposit, 1) * 100)
+
+        if loss_val == 0:
+            bg = "#e8f5e9"; border = "#4caf50"; label = "안전"; label_color = "#2e7d32"
+        elif loss_val < _sim_deposit * 0.05:
+            bg = "#fff8e1"; border = "#ffc107"; label = "주의"; label_color = "#f57f17"
+        elif loss_val < _sim_deposit * 0.15:
+            bg = "#fff3e0"; border = "#ff9800"; label = "경고"; label_color = "#e65100"
+        else:
+            bg = "#fbe9e7"; border = "#f44336"; label = "위험"; label_color = "#c62828"
+
+        col.markdown(
+            f'<div style="background:{bg};border:2px solid {border};border-radius:12px;'
+            f'text-align:center;padding:0.8rem 0.4rem">'
+            f'<div style="font-size:0.7rem;font-weight:700;color:{label_color};'
+            f'text-transform:uppercase;letter-spacing:0.05em">{label}</div>'
+            f'<div style="font-size:1rem;font-weight:700;color:#1a1a1a;margin:0.2rem 0">-{drop_pct}%</div>'
+            f'<div style="font-size:0.8rem;color:#555">'
+            f'못 받는 돈<br><b style="color:{label_color}">{format_currency_krw(loss_val)}</b></div>'
+            f'<div style="font-size:0.72rem;color:#999;margin-top:0.2rem">회수율 {recovery_rate:.0f}%</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+    st.caption(
+        f"시뮬레이션 기준 보증금 {format_currency_krw(_sim_deposit)} · "
+        f"이 동네 추정 전세 총액 {format_currency_krw(_total_jeonse)} · "
+        f"전세가율 {_jeonse_rate:.1f}%"
+    )
+
+    # ── 계약 전 체크리스트 ──
+    st.markdown('<div class="section-gap"></div>', unsafe_allow_html=True)
+    st.markdown(
+        f'<div style="display:flex;align-items:center;gap:6px;margin-bottom:0.3rem">'
+        f'{_icon("checklist", 22, "#1a1a1a")}'
+        f'<span style="font-size:1.05rem;font-weight:700;color:#1a1a1a">계약 전 체크리스트</span>'
+        f"</div>"
+        f'<p style="color:#888;font-size:0.85rem;margin:0 0 0.5rem">'
+        f"전세 계약 전 반드시 확인해야 할 항목입니다.</p>",
+        unsafe_allow_html=True,
+    )
+
+    checklist = [
+        ("등기부등본 확인", "소유자, 근저당, 가압류 등 권리관계를 확인하세요. 계약 당일 다시 발급받아 확인하는 것이 안전합니다."),
+        ("선순위 보증금 확인", "이미 설정된 근저당이나 선순위 전세가 있는지 확인하세요. 내 보증금보다 선순위 합계가 크면 위험합니다."),
+        ("전세보증금 반환보증 가입", "HUG, SGI 등에서 보증보험에 가입할 수 있는지 확인하세요. 보험 가입이 불가한 매물은 피하는 것이 좋습니다."),
+        ("건축물대장 확인", "불법 증축이나 용도 변경이 없는지 확인하세요. 위반 건축물은 보증보험 가입이 거절될 수 있습니다."),
+        ("임대인 세금 체납 확인", "국세·지방세 체납 여부를 확인하세요. 체납이 있으면 보증금 회수가 어려울 수 있습니다."),
+        ("확정일자·전입신고", "계약 후 즉시 전입신고와 확정일자를 받으세요. 대항력과 우선변제권 확보에 필수입니다."),
+    ]
+
+    for title, desc in checklist:
+        st.markdown(
+            f'<div class="s-card" style="margin-bottom:0.5rem;padding:0.8rem 1rem">'
+            f'<div style="display:flex;align-items:flex-start;gap:0.6rem">'
+            f'{_icon("task_alt", 20, "#2d7a52")}'
+            f'<div>'
+            f'<div style="font-weight:600;color:#1a1a1a;font-size:0.9rem">{title}</div>'
+            f'<div style="color:#666;font-size:0.82rem;margin-top:2px;line-height:1.5">{desc}</div>'
+            f'</div></div></div>',
+            unsafe_allow_html=True,
+        )
+
 with tabs[2]:
     st.subheader("동네 비교")
     # 전체 동네 목록에서 검색 가능
@@ -924,22 +1090,24 @@ with tabs[2]:
 
         if history_frames:
             combined_history = pd.concat(history_frames, ignore_index=True)
+            combined_history["YYYYMMDD"] = pd.to_datetime(combined_history["YYYYMMDD"])
+            combined_history["월"] = combined_history["YYYYMMDD"].dt.strftime("%Y년 %m월")
             chart_left, chart_right = st.columns(2)
             chart_left.altair_chart(
                 alt.Chart(combined_history).mark_line(point=True).encode(
-                    x=alt.X("YYYYMMDD:T", title="월"),
-                    y=alt.Y("JEONSE_PRICE:Q", title="전세가"),
+                    x=alt.X("YYYYMMDD:T", title="기간", axis=alt.Axis(format="%Y-%m")),
+                    y=alt.Y("JEONSE_PRICE:Q", title="전세 평당가 (만원)"),
                     color=alt.Color("AREA_LABEL:N", title="동네"),
-                    tooltip=["AREA_LABEL", "YYYYMMDD:T", alt.Tooltip("JEONSE_PRICE:Q", format=",.0f")],
+                    tooltip=["AREA_LABEL", "월:N", alt.Tooltip("JEONSE_PRICE:Q", format=",.0f", title="만원")],
                 ),
                 use_container_width=True,
             )
             chart_right.altair_chart(
                 alt.Chart(combined_history).mark_line(point=True).encode(
-                    x=alt.X("YYYYMMDD:T", title="월"),
+                    x=alt.X("YYYYMMDD:T", title="기간", axis=alt.Axis(format="%Y-%m")),
                     y=alt.Y("JEONSE_RATIO:Q", title="전세가율 (%)"),
                     color=alt.Color("AREA_LABEL:N", title="동네"),
-                    tooltip=["AREA_LABEL", "YYYYMMDD:T", alt.Tooltip("JEONSE_RATIO:Q", format=".1f")],
+                    tooltip=["AREA_LABEL", "월:N", alt.Tooltip("JEONSE_RATIO:Q", format=".1f", title="%")],
                 ),
                 use_container_width=True,
             )
@@ -975,16 +1143,25 @@ with tabs[3]:
     if selected_history_df.empty:
         st.info("선택한 후보의 시세 데이터가 없습니다.")
     else:
+        def _fmt_pyeong_price(val):
+            """평당가(만원 단위)를 자연스럽게 표시."""
+            if not val:
+                return "-"
+            v = float(val)
+            if v >= 10000:
+                return f"{v/10000:.1f}억/평"
+            return f"{v:,.0f}만/평"
+
         metric_1, metric_2, metric_3, metric_4 = st.columns(4)
         metric_1.metric("기준월", str(market_snapshot.get("latest_month", "-")))
         metric_2.metric(
-            "매매가",
-            format_currency_krw(market_snapshot["latest_price"]) if market_snapshot.get("latest_price") else "-",
+            "매매 평당가",
+            _fmt_pyeong_price(market_snapshot.get("latest_price")),
             _format_pct(market_snapshot.get("price_change")),
         )
         metric_3.metric(
-            "전세가",
-            format_currency_krw(market_snapshot["latest_jeonse"]) if market_snapshot.get("latest_jeonse") else "-",
+            "전세 평당가",
+            _fmt_pyeong_price(market_snapshot.get("latest_jeonse")),
             _format_pct(market_snapshot.get("jeonse_change")),
         )
         metric_4.metric(
@@ -996,6 +1173,58 @@ with tabs[3]:
         st.caption(build_market_flow_summary(selected_area, market_snapshot))
         st.markdown(f"**{selected_area}** 매매가·전세가 추이")
         st.altair_chart(make_history_chart(selected_history_df), use_container_width=True)
+
+    # ── 최근 실거래 내역 ──
+    st.markdown('<div class="section-gap"></div>', unsafe_allow_html=True)
+    st.markdown(
+        f'<div style="display:flex;align-items:center;gap:6px;margin-bottom:0.5rem">'
+        f'{_icon("receipt_long", 22, "#1a1a1a")}'
+        f'<span style="font-size:1.05rem;font-weight:700;color:#1a1a1a">{selected_area} 최근 실거래</span>'
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+    tx_type = st.radio("거래 유형 필터", ["전체", "매매", "전세"], horizontal=True, label_visibility="collapsed")
+    raw_tx = load_recent_transactions(session, selected_sgg, selected_emd, limit=50)
+
+    if raw_tx.empty:
+        st.info("최근 거래 내역이 없습니다.")
+    else:
+        if tx_type != "전체":
+            raw_tx = raw_tx[raw_tx["거래유형"] == tx_type]
+
+        raw_tx["거래가(만원)"] = raw_tx["거래가(만원)"].apply(lambda v: f"{v:,.0f}" if pd.notna(v) else "-")
+        raw_tx["평당가(만원)"] = raw_tx["평당가(만원)"].apply(lambda v: f"{v:,.0f}" if pd.notna(v) else "-")
+        st.dataframe(raw_tx, use_container_width=True, hide_index=True, height=350)
+        st.caption(f"총 {len(raw_tx)}건 · 매매=매매가, 전세=보증금 (단위: 만원)")
+
+    # ── 단지별 비교 ──
+    st.markdown('<div class="section-gap"></div>', unsafe_allow_html=True)
+    st.markdown(
+        f'<div style="display:flex;align-items:center;gap:6px;margin-bottom:0.5rem">'
+        f'{_icon("apartment", 22, "#1a1a1a")}'
+        f'<span style="font-size:1.05rem;font-weight:700;color:#1a1a1a">{selected_area} 단지별 시세</span>'
+        f"</div>"
+        f'<p style="color:#888;font-size:0.85rem;margin:0 0 0.5rem">'
+        f"최근 6개월 거래 기준, 단지별 매매·전세 중위가격을 비교합니다.</p>",
+        unsafe_allow_html=True,
+    )
+
+    complex_df = load_complex_summary(session, selected_sgg, selected_emd)
+    if complex_df.empty:
+        st.info("최근 6개월 내 거래가 있는 단지가 없습니다.")
+    else:
+        # 금액 포맷
+        for col in ["매매중위(만원)", "매매평당(만원)", "전세중위(만원)", "전세평당(만원)"]:
+            if col in complex_df.columns:
+                complex_df[col] = complex_df[col].apply(lambda v: f"{v:,.0f}" if pd.notna(v) else "-")
+        if "전세가율(%)" in complex_df.columns:
+            complex_df["전세가율(%)"] = complex_df["전세가율(%)"].apply(lambda v: f"{v:.1f}" if pd.notna(v) else "-")
+        if "주요면적(m²)" in complex_df.columns:
+            complex_df["주요면적(m²)"] = complex_df["주요면적(m²)"].apply(lambda v: f"{v:.0f}" if pd.notna(v) else "-")
+        complex_df = complex_df.fillna("-")
+        st.dataframe(complex_df, use_container_width=True, hide_index=True)
+        st.caption(f"총 {len(complex_df)}개 단지")
 
 # ── 안내 문구 ──
 st.divider()
