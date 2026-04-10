@@ -188,6 +188,19 @@ def load_recent_transactions(_session: Session, sgg: str, emd: str, limit: int =
     return _session.sql(query).to_pandas()
 
 
+@st.cache_data(show_spinner=False)
+def load_pyeong_bucket_data(_session: Session) -> pd.DataFrame:
+    """평형대별 동/구 평당가 + 거래량 + 전세가율."""
+    query = """
+        SELECT SGG, EMD, PYEONG_BUCKET,
+               BUCKET_JEONSE_PRICE, BUCKET_SALE_PRICE,
+               BUCKET_RENT_COUNT, BUCKET_TRADE_COUNT,
+               BUCKET_MEDIAN_AREA, BUCKET_JEONSE_RATE
+        FROM HACKATHON_APP.RESILIENCE.JEONSE_BY_PYEONG_LATEST
+    """
+    return _session.sql(query).to_pandas()
+
+
 @st.cache_data(show_spinner=False, ttl=300)
 def load_complex_summary(_session: Session, sgg: str, emd: str) -> pd.DataFrame:
     """특정 동의 단지별 최근 매매/전세 요약."""

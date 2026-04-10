@@ -272,6 +272,18 @@ def compute_backtest_metrics(history_df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def pyeong_to_bucket(pyeong: int) -> str:
+    """평수를 평형대 버킷으로 변환 (㎡ 기준 SQL 뷰와 일치)."""
+    # SMALL: ≤50㎡ (≈15평), MID: ≤85㎡ (≈25평), LARGE: ≤135㎡ (≈40평), XLARGE: 그 이상
+    if pyeong <= 15:
+        return "SMALL"
+    if pyeong <= 25:
+        return "MID"
+    if pyeong <= 40:
+        return "LARGE"
+    return "XLARGE"
+
+
 def build_recommendation_dataset(
     scores_df: pd.DataFrame,
     history_df: pd.DataFrame,
@@ -282,6 +294,7 @@ def build_recommendation_dataset(
     candidate_area: str,
     search_scope: str,
     budget_tolerance_pct: int,
+    pyeong_bucket_df: pd.DataFrame = None,
 ) -> pd.DataFrame:
     if scores_df.empty:
         return pd.DataFrame()
@@ -307,8 +320,26 @@ def build_recommendation_dataset(
     df["BT_RECOVERY_RATE"] = df["BT_RECOVERY_RATE"].fillna(50.0)
     df["BT_DOWNSIDE_HIT_RATE"] = df["BT_DOWNSIDE_HIT_RATE"].fillna(50.0)
 
-    df["ESTIMATED_TOTAL_JEONSE"] = (df["JEONSE_LATEST"] * preferred_pyeong * unit_multiplier).round(0)
-    df["ESTIMATED_TOTAL_SALE"] = (df["MEME_LATEST"] * preferred_pyeong * unit_multiplier).round(0)
+    # 평형대 데이터가 있으면 우선 사용 (해당 평형대의 평당가로 계산)
+    bucket = pyeong_to_bucket(preferred_pyeong)
+    df["PYEONG_BUCKET"] = bucket
+    df["BUCKET_JEONSE_PRICE"] = pd.NA
+    df["BUCKET_SALE_PRICE"] = pd.NA
+    df["BUCKET_RENT_COUNT"] = 0
+    if pyeong_bucket_df is not None and not pyeong_bucket_df.empty:
+        bucket_filtered = pyeong_bucket_df[pyeong_bucket_df["PYEONG_BUCKET"] == bucket]
+        df = df.drop(columns=["BUCKET_JEONSE_PRICE", "BUCKET_SALE_PRICE", "BUCKET_RENT_COUNT"]).merge(
+            bucket_filtered[["SGG", "EMD", "BUCKET_JEONSE_PRICE", "BUCKET_SALE_PRICE", "BUCKET_RENT_COUNT"]],
+            on=["SGG", "EMD"], how="left"
+        )
+
+    # 평형대 평당가가 있으면 사용, 없으면 동 전체 평균(JEONSE_LATEST) 사용
+    df["EFFECTIVE_JEONSE_PP"] = pd.to_numeric(df["BUCKET_JEONSE_PRICE"], errors="coerce").fillna(df["JEONSE_LATEST"])
+    df["EFFECTIVE_SALE_PP"] = pd.to_numeric(df["BUCKET_SALE_PRICE"], errors="coerce").fillna(df["MEME_LATEST"])
+    df["USES_BUCKET_DATA"] = df["BUCKET_JEONSE_PRICE"].notna()
+
+    df["ESTIMATED_TOTAL_JEONSE"] = (df["EFFECTIVE_JEONSE_PP"] * preferred_pyeong * unit_multiplier).round(0)
+    df["ESTIMATED_TOTAL_SALE"] = (df["EFFECTIVE_SALE_PP"] * preferred_pyeong * unit_multiplier).round(0)
     df["LOSS_EXPOSURE_AMOUNT"] = df.apply(
         lambda row: estimate_loss_amount(row, deposit_amount),
         axis=1,
@@ -536,6 +567,10 @@ def build_card_description(
     pref_diff = float(row.get("PREFERENCE_FIT_SCORE", 0)) - float(candidate_row.get("PREFERENCE_FIT_SCORE", 0))
     if pref_diff > 5:
         points.append(f"생활권 적합도 **+{pref_diff:.1f}점** 개선")
+
+    bucket_count = row.get("BUCKET_RENT_COUNT", 0)
+    if bucket_count and bucket_count >= 5:
+        points.append(f"해당 평형대 최근 6개월 전세 거래 **{int(bucket_count)}건**")
 
     return points[:5]
 

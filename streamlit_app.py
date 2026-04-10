@@ -4,7 +4,7 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 
-from common.queries import load_all_area_history, load_complex_summary, load_recent_transactions, load_scores
+from common.queries import load_all_area_history, load_complex_summary, load_pyeong_bucket_data, load_recent_transactions, load_scores
 from common.recommendation import (
     DIMENSION_LABELS,
     GRADE_MEANINGS,
@@ -526,6 +526,7 @@ inject_styles()
 session = get_safe_session()
 scores_df = load_scores(session)
 all_area_history_df = load_all_area_history(session)
+pyeong_bucket_df = load_pyeong_bucket_data(session)
 
 if scores_df.empty:
     st.error("JEONSE_SAFETY_SCORE에서 데이터를 읽지 못했습니다. setup.sql을 먼저 실행해 주세요.")
@@ -616,34 +617,77 @@ if not st.session_state.get("conditions_confirmed"):
     st.stop()
 
 # ── Step 3: 결과 ──
-with st.sidebar.form("sidebar_conditions"):
+# @st.fragment: 구/동 변경 시 이 블록만 rerun (전체 페이지 rerun 안 함)
+@st.fragment
+def sidebar_controls():
     st.title("추천 조건")
-    selected_sgg = st.selectbox("현재 관심 구", sgg_options, index=sgg_options.index(st.session_state.get("confirmed_sgg", sgg_options[0])))
-    emd_options = sorted(scores_df.loc[scores_df["SGG"] == selected_sgg, "EMD"].dropna().unique().tolist())
-    _default_emd = st.session_state.get("confirmed_emd", emd_options[0])
-    selected_emd = st.selectbox("현재 관심 동", emd_options, index=emd_options.index(_default_emd) if _default_emd in emd_options else 0)
-    deposit_input = st.number_input(
-        "보증금 (억원)",
-        min_value=0.0,
-        step=0.1,
-        value=st.session_state.get("deposit_input_eok", to_eok(st.session_state["deposit_amount"])),
-        format="%.1f",
-    )
-    if deposit_input > _MAX_DEPOSIT_EOK:
-        deposit_input = _MAX_DEPOSIT_EOK
-        st.warning(f"최대 {_MAX_DEPOSIT_EOK:.0f}억원까지 입력 가능합니다.")
-    workplace_sgg = st.selectbox("주요 생활권 / 출근 구", sgg_options, index=sgg_options.index(st.session_state.get("confirmed_workplace", sgg_options[min(1, len(sgg_options) - 1)])))
-    preferred_pyeong = st.slider("희망 평형 (평)", 10, 40, st.session_state.get("confirmed_pyeong", 24), 1)
-    search_scope = st.selectbox("탐색 범위", SEARCH_SCOPE_OPTIONS, index=SEARCH_SCOPE_OPTIONS.index(st.session_state.get("confirmed_scope", SEARCH_SCOPE_OPTIONS[1])))
-    budget_tolerance_pct = st.slider("예산 허용 범위 (±%)", 5, 20, st.session_state.get("confirmed_budget", 10), 1)
 
-    sidebar_submitted = st.form_submit_button("조건 적용", type="primary", use_container_width=True)
+    # form 박스의 기본 border를 숨기고 외부 container border만 사용
+    st.markdown("""<style>
+    [data-testid="stSidebar"] [data-baseweb="select"] {
+        width: 100% !important;
+        max-width: 100% !important;
+    }
+    [data-testid="stSidebar"] [data-baseweb="select"] > div {
+        width: 100% !important;
+    }
+    /* 사이드바 안 form의 기본 border 제거 (외부 container가 border 담당) */
+    [data-testid="stSidebar"] [data-testid="stForm"] {
+        border: none !important;
+        padding: 0 !important;
+    }
+    </style>""", unsafe_allow_html=True)
 
-if sidebar_submitted:
-    st.session_state["deposit_amount"] = from_eok(deposit_input)
-    st.session_state["deposit_input_eok"] = deposit_input
-    st.session_state["confirmed_sgg"] = selected_sgg
-    st.session_state["confirmed_emd"] = selected_emd
+    with st.container(border=True):
+        _sgg = st.selectbox(
+            "현재 관심 구", sgg_options,
+            index=sgg_options.index(st.session_state.get("confirmed_sgg", sgg_options[0])),
+        )
+        _emd_options = sorted(scores_df.loc[scores_df["SGG"] == _sgg, "EMD"].dropna().unique().tolist())
+        _default_emd = st.session_state.get("confirmed_emd", _emd_options[0] if _emd_options else "")
+        _emd = st.selectbox(
+            "현재 관심 동", _emd_options,
+            index=_emd_options.index(_default_emd) if _default_emd in _emd_options else 0,
+        )
+
+        with st.form("sidebar_conditions"):
+            deposit_input = st.number_input(
+                "보증금 (억원)",
+                min_value=0.0,
+                step=0.1,
+                value=st.session_state.get("deposit_input_eok", to_eok(st.session_state["deposit_amount"])),
+                format="%.1f",
+            )
+            if deposit_input > _MAX_DEPOSIT_EOK:
+                deposit_input = _MAX_DEPOSIT_EOK
+                st.warning(f"최대 {_MAX_DEPOSIT_EOK:.0f}억원까지 입력 가능합니다.")
+            workplace_sgg = st.selectbox("주요 생활권 / 출근 구", sgg_options, index=sgg_options.index(st.session_state.get("confirmed_workplace", sgg_options[min(1, len(sgg_options) - 1)])))
+            preferred_pyeong = st.slider("희망 평형 (평)", 10, 40, st.session_state.get("confirmed_pyeong", 24), 1)
+            search_scope = st.selectbox("탐색 범위", SEARCH_SCOPE_OPTIONS, index=SEARCH_SCOPE_OPTIONS.index(st.session_state.get("confirmed_scope", SEARCH_SCOPE_OPTIONS[1])))
+            budget_tolerance_pct = st.slider("예산 허용 범위 (±%)", 5, 20, st.session_state.get("confirmed_budget", 10), 1)
+
+            if st.form_submit_button("조건 적용", type="primary", use_container_width=True):
+                st.session_state["deposit_amount"] = from_eok(min(deposit_input, _MAX_DEPOSIT_EOK))
+                st.session_state["deposit_input_eok"] = min(deposit_input, _MAX_DEPOSIT_EOK)
+                st.session_state["confirmed_sgg"] = _sgg
+                st.session_state["confirmed_emd"] = _emd
+                st.session_state["confirmed_workplace"] = workplace_sgg
+                st.session_state["confirmed_pyeong"] = preferred_pyeong
+                st.session_state["confirmed_scope"] = search_scope
+                st.session_state["confirmed_budget"] = budget_tolerance_pct
+                st.rerun()
+
+with st.sidebar:
+    sidebar_controls()
+
+# 확정된 값 읽기
+selected_sgg = st.session_state.get("confirmed_sgg", sgg_options[0])
+selected_emd_options = sorted(scores_df.loc[scores_df["SGG"] == selected_sgg, "EMD"].dropna().unique().tolist())
+selected_emd = st.session_state.get("confirmed_emd", selected_emd_options[0] if selected_emd_options else "")
+workplace_sgg = st.session_state.get("confirmed_workplace", sgg_options[min(1, len(sgg_options) - 1)])
+preferred_pyeong = st.session_state.get("confirmed_pyeong", 24)
+search_scope = st.session_state.get("confirmed_scope", SEARCH_SCOPE_OPTIONS[1])
+budget_tolerance_pct = st.session_state.get("confirmed_budget", 10)
 
 survey_answers = get_survey_answers()
 survey_result = classify_survey_profile(survey_answers)
@@ -686,6 +730,7 @@ recommendation_df = build_recommendation_dataset(
     candidate_area=selected_area,
     search_scope=search_scope,
     budget_tolerance_pct=budget_tolerance_pct,
+    pyeong_bucket_df=pyeong_bucket_df,
 )
 
 candidate_row = recommendation_df.loc[recommendation_df["AREA_LABEL"] == selected_area].iloc[0]
@@ -758,7 +803,7 @@ with summary_left:
             <div class="s-card-value">{selected_area}</div>
             <div class="s-card-body">
                 <span class="s-card-pill">등급 {candidate_row['GRADE']} · {GRADE_MEANINGS[candidate_row['GRADE']]}</span><br><br>
-                추정 전세 총액 {format_currency_krw(candidate_row['ESTIMATED_TOTAL_JEONSE'])}<br>
+                추정 전세 ({preferred_pyeong}평 기준) {format_currency_krw(candidate_row['ESTIMATED_TOTAL_JEONSE'])}<br>
                 예상 손실 노출 {format_currency_krw(candidate_row['LOSS_EXPOSURE_AMOUNT'])}
             </div>
         </div>
@@ -803,7 +848,14 @@ st.markdown('<div class="section-gap"></div>', unsafe_allow_html=True)
 tabs = st.tabs(["개인화 추천", "후보 진단", "비교 분석", "시장 흐름"])
 
 with tabs[0]:
-    st.subheader("설문 성향을 반영한 추천 결과")
+    st.subheader(f"설문 성향을 반영한 추천 결과 ({preferred_pyeong}평 기준)")
+    _used_bucket = filtered_df["USES_BUCKET_DATA"].sum() if "USES_BUCKET_DATA" in filtered_df.columns else 0
+    _total_filt = len(filtered_df)
+    if _total_filt > 0:
+        st.caption(
+            f"{_used_bucket}/{_total_filt}개 동에서 해당 평형대(±5평) 실거래로 정밀 계산, "
+            f"나머지는 동 평균 사용"
+        )
 
     if best_alternative is None:
         st.success("현재 입력 조건에서는 현재 후보가 이미 상위권으로 보입니다.")
@@ -950,7 +1002,7 @@ with tabs[1]:
         st.dataframe(
             pd.DataFrame(
                 [
-                    ("추정 전세 총액", format_currency_krw(candidate_row["ESTIMATED_TOTAL_JEONSE"])),
+                    (f"추정 전세 ({preferred_pyeong}평 기준)", format_currency_krw(candidate_row["ESTIMATED_TOTAL_JEONSE"])),
                     ("예상 손실 노출", format_currency_krw(candidate_row["LOSS_EXPOSURE_AMOUNT"])),
                     ("전세가율", f"{candidate_row['JEONSE_RATE']:.1f}%"),
                     ("안전 등급", grade_label),
@@ -1020,9 +1072,17 @@ with tabs[1]:
             unsafe_allow_html=True,
         )
 
+    _bucket_label = {
+        "SMALL": "소형 (≤15평)", "MID": "중형 (15~25평)",
+        "LARGE": "대형 (25~40평)", "XLARGE": "특대 (40평+)"
+    }.get(candidate_row.get("PYEONG_BUCKET", "MID"), "")
+    _uses_bucket = bool(candidate_row.get("USES_BUCKET_DATA", False))
+    _bucket_note = f"{_bucket_label} 평형대 시세 반영" if _uses_bucket else "동 평균 시세 (해당 평형대 거래 부족)"
+
     st.caption(
-        f"시뮬레이션 기준 보증금 {format_currency_krw(_sim_deposit)} · "
-        f"이 동네 추정 전세 총액 {format_currency_krw(_total_jeonse)} · "
+        f"{preferred_pyeong}평 기준 · {_bucket_note} · "
+        f"보증금 {format_currency_krw(_sim_deposit)} · "
+        f"추정 전세 {format_currency_krw(_total_jeonse)} · "
         f"전세가율 {_jeonse_rate:.1f}%"
     )
 
