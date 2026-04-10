@@ -1,10 +1,19 @@
 import json
+from concurrent.futures import ThreadPoolExecutor
 
 import altair as alt
 import pandas as pd
 import streamlit as st
 
-from common.queries import load_all_area_history, load_complex_summary, load_pyeong_bucket_data, load_recent_transactions, load_scores
+from common.queries import (
+    load_all_area_history,
+    load_complex_summary,
+    load_market_briefing,
+    load_market_rankings,
+    load_pyeong_bucket_data,
+    load_recent_transactions,
+    load_scores,
+)
 from common.recommendation import (
     DIMENSION_LABELS,
     GRADE_MEANINGS,
@@ -53,6 +62,28 @@ def _profile_card_html(profile: str) -> str:
         f'<div class="profile-card-name">{profile}</div>'
         f'<div class="profile-card-desc">{desc}</div>'
         f"</div></div>"
+    )
+
+
+def _ai_loading_card_html(message: str = "AI가 분석하고 있어요...") -> str:
+    """Animated 'AI is thinking' placeholder card. Reusable across tabs."""
+    return (
+        '<div style="background:linear-gradient(135deg,#f7faf8 0%,#eef5f1 100%);'
+        'border:1px solid #d4e4dc;border-radius:14px;padding:1.5rem 1.6rem;'
+        'margin-bottom:1.0rem;min-height:130px;'
+        'display:flex;align-items:center;justify-content:center;flex-direction:column;gap:0.9rem">'
+        '<div style="display:flex;gap:7px">'
+        '<span style="width:11px;height:11px;border-radius:50%;background:#2d7a52;'
+        'animation:ai-bounce 1.2s infinite ease-in-out"></span>'
+        '<span style="width:11px;height:11px;border-radius:50%;background:#2d7a52;'
+        'animation:ai-bounce 1.2s infinite ease-in-out;animation-delay:0.15s"></span>'
+        '<span style="width:11px;height:11px;border-radius:50%;background:#2d7a52;'
+        'animation:ai-bounce 1.2s infinite ease-in-out;animation-delay:0.3s"></span>'
+        '</div>'
+        f'<div style="font-size:0.92rem;color:#3a5347;letter-spacing:-0.2px;font-weight:500">{message}</div>'
+        '</div>'
+        '<style>@keyframes ai-bounce{0%,80%,100%{transform:scale(0.55);opacity:0.4}'
+        '40%{transform:scale(1);opacity:1}}</style>'
     )
 
 
@@ -177,6 +208,150 @@ def get_candidate_ai_summary(_session, prompt: str) -> str:
     return _extract_cortex_text(result[0][0])
 
 
+@st.cache_data(show_spinner=False, ttl=3600, max_entries=200)
+def get_ai_structured_analysis(_session, cache_key: str, prompt: str) -> dict:  # noqa: ARG001
+    """Cortex AI_COMPLETE로 구조화된 JSON 분석 결과를 반환한다.
+    cache_key는 캐시 식별 전용 (함수 내부에서 사용 안 함). 동/평형/성향만 포함.
+
+    모델 우선순위 (속도·품질 균형):
+      1) claude-3-5-sonnet — 빠르고 JSON 출력 품질 우수
+      2) llama3.1-70b — 거의 모든 Snowflake 리전에서 사용 가능
+      3) mistral-large2 — 최후의 폴백 (느리지만 항상 가능)
+    """
+    _ = cache_key  # cache key marker
+    result = None
+    for model_name in ("claude-3-5-sonnet", "llama3.1-70b", "mistral-large2"):
+        try:
+            result = _session.sql(
+                f"SELECT SNOWFLAKE.CORTEX.COMPLETE('{model_name}', ?)",
+                params=[prompt],
+            ).collect()
+            if result:
+                break
+        except Exception:
+            continue
+    if result is None:
+        return {}
+
+    if not result:
+        return {}
+
+    raw_text = _extract_cortex_text(result[0][0])
+    if not raw_text:
+        return {}
+
+    # JSON 파싱 시도
+    try:
+        # 코드블록 제거
+        cleaned = raw_text.strip()
+        if cleaned.startswith("```"):
+            cleaned = cleaned.split("```")[1]
+            if cleaned.startswith("json"):
+                cleaned = cleaned[4:]
+            cleaned = cleaned.strip()
+        return json.loads(cleaned)
+    except Exception:
+        return {"summary": raw_text, "strengths": [], "risks": [], "recommended_action": "", "confidence": "medium"}
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def call_cortex_analyst(_session, question: str) -> dict:
+    """Cortex Analyst REST API 호출 → 자연어 질문을 SQL로 변환."""
+    import requests
+    conn = _session.connection
+    url = f"https://{conn.host}/api/v2/cortex/analyst/message"
+    headers = {
+        "Authorization": f'Snowflake Token="{conn.rest.token}"',
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    body = {
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": question}]}
+        ],
+        "semantic_model_file": "@HACKATHON_APP.RESILIENCE.SEMANTIC_MODELS/jeonse_model.yaml",
+    }
+    try:
+        r = requests.post(url, headers=headers, json=body, timeout=60)
+        if r.status_code != 200:
+            return {"error": f"API 오류 ({r.status_code}): {r.text[:200]}"}
+        result = r.json()
+        sql = None
+        text = ""
+        for item in result.get("message", {}).get("content", []):
+            if item.get("type") == "sql":
+                sql = item.get("statement")
+            elif item.get("type") == "text":
+                text = item.get("text", "")
+        return {"sql": sql, "text": text}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def run_analyst_question(_session, question: str) -> dict:
+    """질문을 받아 Analyst → SQL 실행 → 결과 반환."""
+    response = call_cortex_analyst(_session, question)
+    if "error" in response:
+        return response
+    sql = response.get("sql")
+    if not sql:
+        return {"error": "SQL을 생성하지 못했습니다.", "text": response.get("text", "")}
+    try:
+        df = _session.sql(sql).to_pandas()
+        return {"sql": sql, "df": df, "text": response.get("text", "")}
+    except Exception as e:
+        return {"error": f"SQL 실행 실패: {e}", "sql": sql}
+
+
+def _interpret_activity(score: float) -> str:
+    """거래 활발도 점수를 자연어로 변환."""
+    if score >= 80:
+        return "매우 활발"
+    if score >= 60:
+        return "활발한 편"
+    if score >= 40:
+        return "보통"
+    if score >= 20:
+        return "다소 부족"
+    return "매우 부족"
+
+
+def _interpret_volatility(score: float) -> str:
+    if score >= 80:
+        return "전세가가 매우 안정적"
+    if score >= 60:
+        return "전세가 변동이 적은 편"
+    if score >= 40:
+        return "보통 수준의 변동성"
+    if score >= 20:
+        return "전세가 변동이 큰 편"
+    return "전세가 변동이 매우 큼"
+
+
+def _interpret_risk(risk: float) -> str:
+    if risk < 20:
+        return "6개월 내 전세가 하락 가능성이 낮음"
+    if risk < 40:
+        return "6개월 내 전세가 하락 가능성이 다소 있음"
+    if risk < 60:
+        return "6개월 내 전세가 하락 가능성이 중간 정도"
+    if risk < 80:
+        return "6개월 내 전세가 하락 가능성이 높은 편"
+    return "6개월 내 전세가 하락 위험이 매우 높음"
+
+
+def _interpret_jeonse_rate(rate: float) -> str:
+    if rate < 30:
+        return "전세가가 매매가의 매우 낮은 비율 (보증금 회수에 매우 안전)"
+    if rate < 50:
+        return "전세가가 매매가의 낮은 비율 (보증금 회수에 안전한 편)"
+    if rate < 70:
+        return "전세가가 매매가의 보통 비율"
+    if rate < 85:
+        return "전세가가 매매가에 가까워 보증금 회수에 주의 필요"
+    return "전세가가 매매가에 매우 근접해 보증금 회수 위험 큼"
+
+
 def build_candidate_ai_prompt(
     selected_area: str,
     grade_label: str,
@@ -184,21 +359,55 @@ def build_candidate_ai_prompt(
     survey_result: dict[str, object],
     history_snapshot: dict[str, object],
 ) -> str:
+    emd = candidate_row.get("EMD", "")
+    rate = float(candidate_row['JEONSE_RATE'])
+    s_mig = float(candidate_row['S_MIG'])
+    s_sub = float(candidate_row['S_SUB'])
+    ml_risk = float(candidate_row.get('ML_RISK_SCORE', 50))
+
     return (
-        "당신은 전세 안전을 설명하는 부동산 데이터 분석가입니다. "
-        "아래 정보를 바탕으로 사용자의 질문 '이 동네 어떤가요?'에 답해주세요. "
-        "응답은 한국어 4문장 이내로 작성하고, 첫 문장은 한줄 총평, "
-        "다음 문장들은 근거와 주의할 점을 쉽게 설명하세요. 전문용어는 최소화하세요.\n\n"
-        f"동네: {selected_area}\n"
-        f"안전등급: {grade_label}\n"
-        f"전세가율: {candidate_row['JEONSE_RATE']:.1f}%\n"
-        f"예상 손실 노출: {format_currency_krw(candidate_row['LOSS_EXPOSURE_AMOUNT'])}\n"
+        f"당신은 서울 부동산 시장의 전세 데이터를 해석해 고객에게 안내하는 분석가입니다.\n"
+        f"아래 제공된 데이터만을 근거로 **{selected_area}**의 전세 환경을 분석해 주세요.\n\n"
+        "**반드시 지켜야 할 규칙:**\n"
+        f"1. **검증 불가능한 구체 사실을 절대 지어내지 마세요.** 다음은 모두 금지입니다:\n"
+        "   - 지하철 노선 번호 (예: '2호선이 지나는', '7호선 역세권')\n"
+        "   - 특정 학교명, 학군 이름, 명문 학원가\n"
+        "   - 재건축 단지명, 재개발 계획, 정비구역 지정 여부\n"
+        "   - 특정 회사·업무지구·랜드마크의 정확한 위치 관계\n"
+        "   - 도로명, 인접 시설명\n"
+        "   당신은 이런 정보를 정확히 모릅니다. 잘못 말하면 사용자에게 큰 피해가 갑니다.\n"
+        "2. 대신 **아래 제공된 데이터(전세가율, 거래 활발도, 가격 안정성, 등급, 시장 흐름)만**을 자연어로 풀어 설명하세요. "
+        f"동네 이름 '{emd}'은 언급하되, 그 동네의 일반적 분위기(예: '주거 밀집 지역', '거래가 활발한 동네')를 데이터 기반으로만 표현하세요.\n"
+        "3. **모든 문장은 정중한 존댓말 (~입니다, ~합니다, ~보입니다, ~해보세요)을 사용**하세요. 반말·단정조 금지.\n"
+        "4. **표현 톤은 부드럽고 차분하게**. 자극적·과장된 단어 금지.\n"
+        "   ❌ 너무 강함: '집주인이 보증금을 돌려주지 못할 위험이 큽니다'\n"
+        "   ✅ 좋음: '전세가가 매매가에 거의 근접해 깡통전세 위험에 유의가 필요한 상황입니다'\n"
+        "5. **점수, 퍼센트, /100 같은 수치 표현을 직접 사용하지 마세요**.\n"
+        "   ❌ 나쁨: '거래 활발도 91/100', 'AI 하락 위험도 77%'\n"
+        "   ✅ 좋음: '최근 거래가 매우 활발하게 이루어지고 있습니다', '향후 전세가 하락 가능성이 다소 있는 편입니다'\n"
+        "6. '안전한 지역입니다', '주의가 필요합니다' 같은 일반론·상투구만으로 끝내지 말고 데이터 근거를 풀어 설명해 주세요.\n"
+        "7. 따뜻하고 정중한 상담 톤으로, 부동산 전문가가 고객에게 차분히 안내하는 느낌.\n\n"
+        "**반드시 JSON 형식만** 출력하세요:\n"
+        "{\n"
+        f'  "summary": "{emd}의 전세 환경에 대한 총평 (80~120자, 데이터 기반, 수치 표현 금지, 존댓말)",\n'
+        '  "strengths": ["데이터 기반 강점 (~입니다)", ...3개],\n'
+        '  "risks": ["데이터 기반 주의점 (~입니다)", ...2개],\n'
+        '  "recommended_action": "사용자 성향에 맞는 구체적 행동 권장 (수치 없이, 정중한 존댓말 권유)",\n'
+        '  "confidence": "high|medium|low"\n'
+        "}\n\n"
+        f"=== 사용자 ===\n"
+        f"성향: {survey_result['profile']} - {survey_result.get('description', '')}\n\n"
+        f"=== {selected_area} 데이터 (이것만 사용하세요) ===\n"
+        f"안전 등급: {grade_label}\n"
         f"추정 전세 총액: {format_currency_krw(candidate_row['ESTIMATED_TOTAL_JEONSE'])}\n"
-        f"전세가율 점수: {candidate_row['S_RATE']:.1f}/100\n"
-        f"거래활발도 점수: {candidate_row['S_MIG']:.1f}/100\n"
-        f"안정성 보조 점수: {candidate_row['S_SUB']:.1f}/100\n"
-        f"사용자 성향: {survey_result['profile']}\n"
-        f"최근 시장 요약: {build_market_flow_summary(selected_area, history_snapshot)}"
+        f"전세가율 해석: {_interpret_jeonse_rate(rate)}\n"
+        f"거래 활발도 해석: 최근 거래가 {_interpret_activity(s_mig)}함\n"
+        f"가격 안정성 해석: {_interpret_volatility(s_sub)}\n"
+        f"AI 예측: {_interpret_risk(ml_risk)}\n"
+        f"최근 시장 흐름: {build_market_flow_summary(selected_area, history_snapshot)}\n\n"
+        f"위 데이터만을 근거로 분석을 작성해 주세요. "
+        f"지하철 노선·학교명·재건축 계획 등 검증 불가능한 사실은 절대 지어내지 마시고, "
+        f"숫자는 직접 쓰지 마시고, 모든 문장은 부드러운 존댓말로 작성하세요. JSON만 출력:"
     )
 
 
@@ -736,6 +945,15 @@ recommendation_df = build_recommendation_dataset(
 candidate_row = recommendation_df.loc[recommendation_df["AREA_LABEL"] == selected_area].iloc[0]
 filtered_df = recommendation_df[recommendation_df["FILTER_MATCH"]].copy()
 better_df = recommendation_df[recommendation_df["BETTER_ALTERNATIVE"]].copy()
+
+# 보증금 부족 케이스: 후보가 보증금보다 비싸면 BETTER_ALTERNATIVE가 비어있을 수 있음
+# → 필터 통과 + 후보 제외한 동에서 안전점수 높은 순으로 fallback
+if better_df.empty:
+    fallback_pool = recommendation_df[
+        recommendation_df["FILTER_MATCH"] & (~recommendation_df["IS_CANDIDATE"])
+    ].copy()
+    if not fallback_pool.empty:
+        better_df = fallback_pool.nlargest(10, "RECOMMENDATION_SCORE").copy()
 best_alternative = better_df.iloc[0] if not better_df.empty else None
 selected_history_df = get_area_history(all_area_history_df, candidate_row["SGG"], candidate_row["EMD"])
 market_snapshot = build_market_flow_snapshot(selected_history_df)
@@ -745,6 +963,39 @@ _loading_ph.empty()
 
 # ── Profile + metrics ──
 st.markdown(_profile_card_html(survey_result["profile"]), unsafe_allow_html=True)
+
+# ── 보증금 vs 추정 전세 차이 경고 (보증금 부족 시 결과 숨김) ──
+_cand_jeonse = float(candidate_row["ESTIMATED_TOTAL_JEONSE"])
+if deposit_amount > 0 and _cand_jeonse > deposit_amount * 1.5:
+    _shortfall = _cand_jeonse - deposit_amount
+    st.markdown(
+        f'<div style="background:#fff8e1;border-left:5px solid #f57f17;border-radius:10px;'
+        f'padding:1.5rem;margin:1rem 0">'
+        f'<div style="display:flex;align-items:center;gap:8px;margin-bottom:0.5rem">'
+        f'{_icon("warning", 24, "#e65100")}'
+        f'<span style="font-size:1.1rem;font-weight:700;color:#e65100">보증금이 부족해요</span>'
+        f'</div>'
+        f'<div style="font-size:0.95rem;color:#1a1a1a;line-height:1.7">'
+        f'<b>{selected_area}</b>의 {preferred_pyeong}평 예상 전세는 '
+        f'<b>{format_currency_krw(_cand_jeonse)}</b>인데, '
+        f'입력하신 보증금은 <b>{format_currency_krw(deposit_amount)}</b>이에요.<br>'
+        f'약 <b style="color:#c62828">{format_currency_krw(_shortfall)}</b> 부족해서 이 동네는 추천하기 어려워요.'
+        f'</div>'
+        f'<div style="margin-top:1rem;padding-top:1rem;border-top:1px solid #ffe082;'
+        f'font-size:0.9rem;color:#5d4037">'
+        f'💡 <b>왼쪽 사이드바에서 보증금을 올린 후 "조건 적용"을 눌러보세요.</b><br>'
+        f'또는 다른 동네를 선택하시면 맞춤 추천을 받으실 수 있어요.'
+        f'</div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+    # 안내 문구 + 면책 표시 후 stop
+    st.divider()
+    st.caption(
+        "본 서비스의 추천 결과는 공개 데이터 기반의 참고 정보이며, "
+        "법률·세무·투자 판단을 대체하지 않습니다."
+    )
+    st.stop()
 
 # 데이터 활용 안내 (SPH 3개 구 여부)
 _SPH_DISTRICTS = {"중구", "영등포구", "서초구"}
@@ -765,32 +1016,60 @@ else:
         unsafe_allow_html=True,
     )
 
-# 3개 점수 분리 표시: 룰 기반 / AI 예측 / 최종 하이브리드
-score_1, score_2, score_3 = st.columns(3)
-score_1.metric(
-    "룰 기반 안전점수",
-    f"{candidate_row.get('RULE_SCORE', candidate_row['RECOMMENDATION_SCORE']):.1f}점",
-    help="전세가율, 거래량, 가격안정성 등 공식 기반 점수",
-)
+# 메인 점수: "나의 적합도" 하나만 크게
+_main_score = candidate_row['RECOMMENDATION_SCORE']
 _ml_risk = candidate_row.get('ML_RISK_SCORE', 50)
-score_2.metric(
-    "AI 하락 위험도",
-    f"{_ml_risk:.0f}%",
-    delta=f"{'낮음' if _ml_risk < 30 else '보통' if _ml_risk < 60 else '높음'}",
-    delta_color="inverse",
-    help="6개월 내 전세가 5% 이상 하락할 확률 (ML 예측)",
-)
-score_3.metric(
-    "최종 추천점수",
-    f"{candidate_row['RECOMMENDATION_SCORE']:.1f}점",
-    help="룰 기반 80% + AI 예측 20% 하이브리드",
+
+# 점수에 따른 색상
+if _main_score >= 75:
+    _score_color = "#2d7a52"
+    _score_label = "매우 적합"
+elif _main_score >= 55:
+    _score_color = "#1565c0"
+    _score_label = "적합한 편"
+elif _main_score >= 35:
+    _score_color = "#f57f17"
+    _score_label = "주의 필요"
+else:
+    _score_color = "#c62828"
+    _score_label = "위험"
+
+st.markdown(
+    f'<div style="background:linear-gradient(135deg,#fff 0%,#f7faf8 100%);'
+    f'border:1px solid #d4e4dc;border-left:5px solid {_score_color};border-radius:14px;'
+    f'padding:1.3rem 1.6rem;margin-bottom:0.8rem">'
+    f'<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:0.5rem">'
+    f'<div>'
+    f'<div style="font-size:0.78rem;color:#888;text-transform:uppercase;letter-spacing:0.05em;font-weight:600">'
+    f'나의 적합도 점수</div>'
+    f'<div style="margin-top:0.3rem"><span style="font-size:2.6rem;font-weight:800;color:{_score_color}">{_main_score:.1f}</span>'
+    f'<span style="font-size:1.1rem;color:#666;margin-left:0.3rem">/ 100</span>'
+    f'<span style="background:{_score_color};color:#fff;padding:4px 12px;border-radius:999px;'
+    f'font-size:0.78rem;font-weight:700;margin-left:0.8rem;vertical-align:middle">{_score_label}</span></div>'
+    f'</div>'
+    f'<div style="text-align:right">'
+    f'<div style="font-size:0.78rem;color:#888;font-weight:600">현재 후보 순위</div>'
+    f'<div style="font-size:1.6rem;font-weight:800;color:#1a1a1a;margin-top:0.2rem">{int(candidate_row["RECOMMENDATION_RANK"])}<span style="font-size:1rem;color:#888">위 / {len(recommendation_df)}</span></div>'
+    f'</div>'
+    f'</div>'
+    f'<div style="margin-top:0.7rem;padding-top:0.7rem;border-top:1px solid #e8eee9;'
+    f'font-size:0.8rem;color:#666;line-height:1.55">'
+    f'동네 안전도, AI 하락 예측, 회원님의 보증금·성향·평형을 모두 반영한 종합 점수입니다.'
+    f'</div>'
+    f'</div>',
+    unsafe_allow_html=True,
 )
 
+# 보조 정보 메트릭
 hero_1, hero_2, hero_3, hero_4 = st.columns(4)
-hero_1.metric("분류 성향", survey_result["profile"])
-hero_2.metric("현재 후보 순위", f"{int(candidate_row['RECOMMENDATION_RANK'])}위")
+hero_1.metric("안전 등급", f"{candidate_row['GRADE']} · {GRADE_MEANINGS[candidate_row['GRADE']]}")
+hero_2.metric("AI 하락 위험도", f"{_ml_risk:.0f}%", help="AI가 예측한 6개월 내 전세가 5% 이상 하락할 확률")
 hero_3.metric("조건 충족 대안", len(filtered_df) - 1 if len(filtered_df) > 0 else 0)
-hero_4.metric("현재 후보 예상 손실", format_currency_krw(candidate_row["LOSS_EXPOSURE_AMOUNT"]))
+hero_4.metric(
+    "예상 전세가",
+    format_currency_krw(candidate_row["ESTIMATED_TOTAL_JEONSE"]),
+    help=f"{preferred_pyeong}평 기준 이 동네 추정 전세 보증금",
+)
 
 st.markdown('<div class="section-gap"></div>', unsafe_allow_html=True)
 
@@ -802,9 +1081,9 @@ with summary_left:
             <div class="s-card-label">현재 후보</div>
             <div class="s-card-value">{selected_area}</div>
             <div class="s-card-body">
-                <span class="s-card-pill">등급 {candidate_row['GRADE']} · {GRADE_MEANINGS[candidate_row['GRADE']]}</span><br><br>
-                추정 전세 ({preferred_pyeong}평 기준) {format_currency_krw(candidate_row['ESTIMATED_TOTAL_JEONSE'])}<br>
-                예상 손실 노출 {format_currency_krw(candidate_row['LOSS_EXPOSURE_AMOUNT'])}
+                <span class="s-card-pill">{candidate_row['GRADE']}등급 · {GRADE_MEANINGS[candidate_row['GRADE']]}</span><br><br>
+                예상 전세가 ({preferred_pyeong}평) {format_currency_krw(candidate_row['ESTIMATED_TOTAL_JEONSE'])}<br>
+                전세가율 {candidate_row['JEONSE_RATE']:.1f}%
             </div>
         </div>
         """,
@@ -817,9 +1096,9 @@ with summary_right:
             f"""
             <div class="s-card">
                 <div class="s-card-label">성향 반영 결과</div>
-                <div class="s-card-value">{survey_result['profile']} 기준 현재 후보 유지</div>
+                <div class="s-card-value">현재 후보가 이미 좋아요</div>
                 <div class="s-card-body">
-                    현재 입력 조건에서는 현재 후보보다 손실 노출이 낮고 최종 추천점수가 더 높은 대안이 보이지 않습니다.<br>
+                    이 조건에서는 현재 후보보다 더 나은 대안이 보이지 않습니다.<br>
                     {survey_result['description']}
                 </div>
             </div>
@@ -833,10 +1112,9 @@ with summary_right:
                 <div class="s-card-label">가장 유력한 대안</div>
                 <div class="s-card-value">{best_alternative['AREA_LABEL']}</div>
                 <div class="s-card-body">
-                    <span class="s-card-pill">최종 추천점수 +{best_alternative['VS_CANDIDATE_DELTA']:.1f}</span><br><br>
-                    공통 안전점수 {best_alternative['SAFETY_SCORE']:.1f}점<br>
-                    예상 손실 노출 {format_currency_krw(best_alternative['LOSS_EXPOSURE_AMOUNT'])}<br>
-                    선호 적합도 {best_alternative['PREFERENCE_FIT_SCORE']:.1f}점
+                    <span class="s-card-pill">{best_alternative['GRADE']}등급 · {GRADE_MEANINGS[best_alternative['GRADE']]}</span><br><br>
+                    예상 전세가 ({preferred_pyeong}평) {format_currency_krw(best_alternative['ESTIMATED_TOTAL_JEONSE'])}<br>
+                    전세가율 {best_alternative['JEONSE_RATE']:.1f}%
                 </div>
             </div>
             """,
@@ -845,7 +1123,40 @@ with summary_right:
 
 st.markdown('<div class="section-gap"></div>', unsafe_allow_html=True)
 
-tabs = st.tabs(["개인화 추천", "후보 진단", "비교 분석", "시장 흐름"])
+# ──────────────────────────────────────────────────────────────────────
+# 2-pass lazy AI 로딩
+# - 1차 렌더: 빠른 콘텐츠(추천 결과, 비교 분석, 시장 랭킹, 선택동 상세)는 즉시 표시
+#             AI 부분은 로딩 카드만 보여줌 → 사용자가 추천 페이지를 바로 볼 수 있음
+# - 2차 렌더: 백그라운드 AI 호출 완료 후 st.rerun()으로 자동 새로고침
+#             캐시에서 즉시 응답하므로 두 번째 렌더는 빠름
+# - 같은 동/성향이면 캐시 hit으로 첫 렌더부터 ai_warm = True
+# ──────────────────────────────────────────────────────────────────────
+grade_label = f"{candidate_row['GRADE']} · {GRADE_MEANINGS[candidate_row['GRADE']]}"
+cortex_prompt = build_candidate_ai_prompt(
+    selected_area=selected_area,
+    grade_label=grade_label,
+    candidate_row=candidate_row,
+    survey_result=survey_result,
+    history_snapshot=market_snapshot,
+)
+_ai_cache_key = f"{selected_area}|{preferred_pyeong}|{survey_result['profile']}"
+
+# AI 결과가 이번 입력 조합에 대해 이미 캐시되어 있는지 추적
+_ai_warm = st.session_state.get("_ai_warm_key") == _ai_cache_key
+
+# 빠른 데이터 (랭킹)는 항상 즉시 호출
+market_rankings = load_market_rankings(session)
+
+if _ai_warm:
+    # 캐시 hit — 즉시 응답 (실제로는 ms 단위)
+    analysis = get_ai_structured_analysis(session, _ai_cache_key, cortex_prompt)
+    briefing = load_market_briefing(session, survey_result["profile"])
+else:
+    # 1차 렌더: 빈 placeholder
+    analysis = None
+    briefing = None
+
+tabs = st.tabs(["개인화 추천", "후보 진단", "비교 분석", "시장 흐름", "AI 질문"])
 
 with tabs[0]:
     st.subheader(f"설문 성향을 반영한 추천 결과 ({preferred_pyeong}평 기준)")
@@ -863,7 +1174,7 @@ with tabs[0]:
         # 15번: 3가지 유형 대안 선별
         typed = pick_typed_alternatives(better_df, candidate_row)
         type_labels = {
-            "safest": ("가장 안전한 대안", "손실 노출을 최소화한 후보"),
+            "safest": ("가장 안전한 대안", "전세가율이 가장 낮은 후보"),
             "balanced": ("가장 균형 잡힌 대안", "안전성과 생활권을 함께 고려한 후보"),
             "similar": ("가장 비슷하지만 더 안전한 대안", "현재 후보와 유사하면서 더 안전한 후보"),
         }
@@ -884,8 +1195,15 @@ with tabs[0]:
                     )
                 else:
                     # 14번: 추천 카드 — 개선 포인트 리스트
+                    import re as _re
                     points = build_card_description(alt_row, candidate_row)
-                    points_html = "".join(f"<li>{p}</li>" for p in points)
+                    # 마크다운 **bold** → HTML <strong>
+                    _bold_pattern = r"\*\*(.+?)\*\*"
+                    _bold_replace = r"<strong>\1</strong>"
+                    points_html = "".join(
+                        "<li>" + _re.sub(_bold_pattern, _bold_replace, p) + "</li>"
+                        for p in points
+                    )
                     st.markdown(
                         f'<div class="s-card">'
                         f'<div class="s-card-label">{title}</div>'
@@ -902,42 +1220,54 @@ with tabs[0]:
     top_chart_df = filtered_df.head(8).copy()
     if not top_chart_df.empty:
         chart = alt.Chart(top_chart_df).mark_bar(cornerRadiusEnd=8).encode(
-            x=alt.X("RECOMMENDATION_SCORE:Q", title="최종 추천점수", scale=alt.Scale(domain=[0, 100])),
+            x=alt.X("RECOMMENDATION_SCORE:Q", title="나의 적합도", scale=alt.Scale(domain=[0, 100])),
             y=alt.Y("AREA_LABEL:N", sort="-x", title="동네"),
             color=alt.condition(alt.datum.IS_CANDIDATE, alt.value("#ef6c00"), alt.value("#2d7a52")),
             tooltip=[
-                "AREA_LABEL",
-                alt.Tooltip("RECOMMENDATION_SCORE:Q", format=".1f"),
-                alt.Tooltip("SAFETY_SCORE:Q", format=".1f"),
-                alt.Tooltip("LOSS_EXPOSURE_AMOUNT:Q", format=",.0f"),
+                alt.Tooltip("AREA_LABEL:N", title="동네"),
+                alt.Tooltip("RECOMMENDATION_SCORE:Q", title="점수", format=".1f"),
+                alt.Tooltip("GRADE:N", title="안전등급"),
+                alt.Tooltip("JEONSE_RATE:Q", title="전세가율(%)", format=".1f"),
             ],
         )
         st.altair_chart(chart, use_container_width=True)
 
-    recommendation_table = filtered_df[
+    # 안전등급 가이드
+    st.caption(
+        "💡 **안전등급 (A/B/C/D)**: 동네 자체의 객관 안전도. "
+        "**나의 적합도**: 안전등급 + 회원님 보증금·평형·성향까지 반영한 종합 점수."
+    )
+
+    medal_map = {1: "🥇", 2: "🥈", 3: "🥉"}
+    recommendation_table = filtered_df.head(5)[
         [
             "RECOMMENDATION_RANK",
             "AREA_LABEL",
             "GRADE",
             "RECOMMENDATION_SCORE",
             "JEONSE_RATE",
-            "LOSS_EXPOSURE_AMOUNT",
-            "VS_CANDIDATE_DELTA",
+            "ESTIMATED_TOTAL_JEONSE",
         ]
-    ].head(10).copy()
+    ].copy()
+    recommendation_table["RECOMMENDATION_RANK"] = recommendation_table["RECOMMENDATION_RANK"].apply(
+        lambda r: f"{medal_map.get(int(r), '')} {int(r)}위"
+    )
+    recommendation_table["GRADE"] = recommendation_table["GRADE"].apply(
+        lambda g: f"{g}등급 ({GRADE_MEANINGS.get(g, '')})"
+    )
     recommendation_table = recommendation_table.rename(
         columns={
             "RECOMMENDATION_RANK": "순위",
             "AREA_LABEL": "동네",
             "GRADE": "안전등급",
-            "RECOMMENDATION_SCORE": "추천점수",
+            "RECOMMENDATION_SCORE": "나의 적합도",
             "JEONSE_RATE": "전세가율",
-            "LOSS_EXPOSURE_AMOUNT": "예상 손실 노출",
-            "VS_CANDIDATE_DELTA": "현재 후보 대비",
+            "ESTIMATED_TOTAL_JEONSE": "예상 전세가",
         }
     )
-    recommendation_table["예상 손실 노출"] = recommendation_table["예상 손실 노출"].map(format_currency_krw)
+    recommendation_table["예상 전세가"] = recommendation_table["예상 전세가"].map(format_currency_krw)
     recommendation_table["전세가율"] = recommendation_table["전세가율"].map(lambda v: f"{v:.1f}%")
+    recommendation_table["나의 적합도"] = recommendation_table["나의 적합도"].map(lambda v: f"{v:.1f}점")
     st.dataframe(recommendation_table, use_container_width=True, hide_index=True)
 
     # 제외된 주요 후보와 제외 사유
@@ -961,13 +1291,128 @@ with tabs[0]:
                 )
 
 with tabs[1]:
-    st.subheader("현재 후보 진단")
+    # ── 헤더: 동네명 + 등급 ──
+    st.markdown(
+        f'<div style="display:flex;align-items:baseline;justify-content:space-between;'
+        f'margin-bottom:0.8rem;flex-wrap:wrap;gap:0.5rem">'
+        f'<div>'
+        f'<div style="font-size:0.78rem;color:#999;text-transform:uppercase;letter-spacing:0.05em">현재 후보</div>'
+        f'<h2 style="margin:0;color:#1a1a1a;font-size:1.6rem">{selected_area}</h2>'
+        f'</div>'
+        f'<div style="display:flex;gap:0.4rem;align-items:center">'
+        f'<span style="background:#e8f2ec;color:#2d7a52;padding:6px 14px;border-radius:999px;'
+        f'font-weight:700;font-size:0.85rem">{grade_label}</span>'
+        f'<span style="background:#f5f7fa;color:#555;padding:6px 14px;border-radius:999px;'
+        f'font-weight:600;font-size:0.85rem">{preferred_pyeong}평 기준</span>'
+        f'</div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
 
-    grade_label = f"{candidate_row['GRADE']} · {GRADE_MEANINGS[candidate_row['GRADE']]}"
+    # ── 핵심 지표 3개 (한 줄) ──
     diag_1, diag_2, diag_3 = st.columns(3)
-    diag_1.metric("안전 등급", grade_label)
-    diag_2.metric("전세가율", f"{candidate_row['JEONSE_RATE']:.1f}%")
-    diag_3.metric("예상 손실 노출", format_currency_krw(candidate_row["LOSS_EXPOSURE_AMOUNT"]))
+    diag_1.metric(
+        "전세가율", f"{candidate_row['JEONSE_RATE']:.1f}%",
+        help="전세가가 매매가의 몇 %인지. 낮을수록 안전 (보증금 회수 쉬움)",
+    )
+    diag_2.metric(
+        f"예상 전세가 ({preferred_pyeong}평)",
+        format_currency_krw(candidate_row["ESTIMATED_TOTAL_JEONSE"]),
+        help="이 동네 해당 평형대 최근 거래 기반 추정",
+    )
+    diag_3.metric(
+        "AI 하락 위험도",
+        f"{candidate_row.get('ML_RISK_SCORE', 50):.0f}%",
+        help="AI가 예측한 6개월 내 전세가 5%+ 하락 확률",
+    )
+
+    # ── AI 분석 (전체 너비, 총평이 메인) ──
+    # 분석은 탭 렌더 전에 미리 호출되어 `analysis` 변수에 저장됨
+    st.markdown('<div class="section-gap"></div>', unsafe_allow_html=True)
+
+    if analysis and analysis.get("summary"):
+        confidence = analysis.get("confidence", "medium")
+        conf_label = {"high": "신뢰도 높음", "medium": "신뢰도 보통", "low": "신뢰도 낮음"}.get(confidence, "신뢰도 보통")
+        conf_color = {"high": "#2e7d32", "medium": "#f57f17", "low": "#c62828"}.get(confidence, "#666")
+
+        # 헤더 + 총평 (단일 hero 카드)
+        st.markdown(
+            f'<div style="background:linear-gradient(135deg,#f7faf8 0%,#eef5f1 100%);'
+            f'border:1px solid #d4e4dc;border-radius:14px;padding:1.3rem 1.5rem;margin-bottom:0.8rem">'
+            f'<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.5rem">'
+            f'<div style="display:flex;align-items:center;gap:8px">'
+            f'{_icon("auto_awesome", 22, "#2d7a52")}'
+            f'<span style="font-size:0.78rem;font-weight:700;color:#2d7a52;'
+            f'text-transform:uppercase;letter-spacing:0.05em">Snowflake Cortex AI 분석</span>'
+            f'</div>'
+            f'<span style="background:#fff;border:1px solid {conf_color}33;color:{conf_color};'
+            f'padding:3px 10px;border-radius:999px;font-size:0.7rem;font-weight:600">{conf_label}</span>'
+            f'</div>'
+            f'<div style="font-size:1.1rem;font-weight:600;color:#1a1a1a;line-height:1.6">'
+            f'{analysis.get("summary", "")}</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+        # 강점 / 주의 / 추천 행동 (3열)
+        strengths = analysis.get("strengths", [])
+        risks = analysis.get("risks", [])
+        action = analysis.get("recommended_action", "")
+
+        col_s, col_r, col_a = st.columns(3)
+        with col_s:
+            items = "".join(f'<li style="margin-bottom:6px;line-height:1.5">{s}</li>' for s in strengths[:3])
+            st.markdown(
+                f'<div style="background:#fff;border:1px solid #c8e0d2;border-left:4px solid #4caf50;'
+                f'border-radius:10px;padding:1rem 1.1rem;height:100%">'
+                f'<div style="display:flex;align-items:center;gap:6px;margin-bottom:0.5rem">'
+                f'{_icon("check_circle", 18, "#2e7d32")}'
+                f'<span style="font-weight:700;color:#2e7d32;font-size:0.88rem">강점</span>'
+                f'</div>'
+                f'<ul style="padding-left:1.1rem;margin:0;color:#444;font-size:0.83rem">{items}</ul>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+        with col_r:
+            items = "".join(f'<li style="margin-bottom:6px;line-height:1.5">{r}</li>' for r in risks[:3])
+            st.markdown(
+                f'<div style="background:#fff;border:1px solid #f0d4c4;border-left:4px solid #ff9800;'
+                f'border-radius:10px;padding:1rem 1.1rem;height:100%">'
+                f'<div style="display:flex;align-items:center;gap:6px;margin-bottom:0.5rem">'
+                f'{_icon("warning", 18, "#e65100")}'
+                f'<span style="font-weight:700;color:#e65100;font-size:0.88rem">주의</span>'
+                f'</div>'
+                f'<ul style="padding-left:1.1rem;margin:0;color:#444;font-size:0.83rem">{items}</ul>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+        with col_a:
+            st.markdown(
+                f'<div style="background:#fff;border:1px solid #d5dde6;border-left:4px solid #1976d2;'
+                f'border-radius:10px;padding:1rem 1.1rem;height:100%">'
+                f'<div style="display:flex;align-items:center;gap:6px;margin-bottom:0.5rem">'
+                f'{_icon("lightbulb", 18, "#1565c0")}'
+                f'<span style="font-weight:700;color:#1565c0;font-size:0.88rem">추천 행동</span>'
+                f'</div>'
+                f'<div style="color:#444;font-size:0.83rem;line-height:1.6">{action}</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+    elif not _ai_warm:
+        # 1차 렌더 — AI 분석 로딩 중
+        st.markdown(
+            _ai_loading_card_html(
+                f"AI가 {selected_area}의 전세 환경을 살펴보고 있습니다. 잠시만 기다려 주세요."
+            ),
+            unsafe_allow_html=True,
+        )
+    else:
+        # Fallback (AI 호출은 끝났는데 결과가 비어있는 경우)
+        st.info(build_candidate_summary(candidate_row, survey_result))
+
+    # ── 차원별 점수 차트 ──
+    st.markdown('<div class="section-gap"></div>', unsafe_allow_html=True)
+    st.markdown("#### 안전점수 구성")
 
     dim_df = pd.DataFrame(
         {
@@ -975,43 +1420,16 @@ with tabs[1]:
             "점수": [candidate_row[key] for key in DIMENSION_LABELS],
         }
     )
-    left, right = st.columns([1, 1])
-    with left:
-        st.altair_chart(
-            alt.Chart(dim_df).mark_bar(cornerRadiusEnd=8).encode(
-                x=alt.X("점수:Q", scale=alt.Scale(domain=[0, 100])),
-                y=alt.Y("항목:N", sort="-x"),
-                color=alt.Color("점수:Q", legend=None),
-                tooltip=["항목", "점수"],
-            ),
-            use_container_width=True,
-        )
-    with right:
-        st.markdown("#### 이 동네는 어떤가요?")
-        cortex_prompt = build_candidate_ai_prompt(
-            selected_area=selected_area,
-            grade_label=grade_label,
-            candidate_row=candidate_row,
-            survey_result=survey_result,
-            history_snapshot=market_snapshot,
-        )
-        ai_summary = get_candidate_ai_summary(session, cortex_prompt)
-        st.write(ai_summary or build_candidate_summary(candidate_row, survey_result))
-
-        st.markdown("#### 상세 정보")
-        st.dataframe(
-            pd.DataFrame(
-                [
-                    (f"추정 전세 ({preferred_pyeong}평 기준)", format_currency_krw(candidate_row["ESTIMATED_TOTAL_JEONSE"])),
-                    ("예상 손실 노출", format_currency_krw(candidate_row["LOSS_EXPOSURE_AMOUNT"])),
-                    ("전세가율", f"{candidate_row['JEONSE_RATE']:.1f}%"),
-                    ("안전 등급", grade_label),
-                ],
-                columns=["항목", "값"],
-            ),
-            use_container_width=True,
-            hide_index=True,
-        )
+    st.altair_chart(
+        alt.Chart(dim_df).mark_bar(cornerRadiusEnd=8, size=18).encode(
+            x=alt.X("점수:Q", scale=alt.Scale(domain=[0, 100]), title=""),
+            y=alt.Y("항목:N", sort="-x", title=""),
+            color=alt.Color("점수:Q", legend=None,
+                            scale=alt.Scale(scheme="greens", domain=[0, 100])),
+            tooltip=["항목", alt.Tooltip("점수:Q", format=".0f")],
+        ).properties(height=120),
+        use_container_width=True,
+    )
 
     # ── 위기 시뮬레이션 ──
     st.markdown('<div class="section-gap"></div>', unsafe_allow_html=True)
@@ -1178,7 +1596,6 @@ with tabs[2]:
                 "GRADE",
                 "RECOMMENDATION_SCORE",
                 "JEONSE_RATE",
-                "LOSS_EXPOSURE_AMOUNT",
                 "ESTIMATED_TOTAL_JEONSE",
             ]
         ].copy()
@@ -1186,32 +1603,256 @@ with tabs[2]:
             columns={
                 "AREA_LABEL": "동네",
                 "GRADE": "안전등급",
-                "RECOMMENDATION_SCORE": "추천점수",
+                "RECOMMENDATION_SCORE": "나의 적합도",
                 "JEONSE_RATE": "전세가율",
-                "LOSS_EXPOSURE_AMOUNT": "예상 손실 노출",
-                "ESTIMATED_TOTAL_JEONSE": "추정 전세 총액",
+                "ESTIMATED_TOTAL_JEONSE": "예상 전세가",
             }
         )
-        compare_table["예상 손실 노출"] = compare_table["예상 손실 노출"].map(format_currency_krw)
-        compare_table["추정 전세 총액"] = compare_table["추정 전세 총액"].map(format_currency_krw)
+        compare_table["예상 전세가"] = compare_table["예상 전세가"].map(format_currency_krw)
         compare_table["전세가율"] = compare_table["전세가율"].map(lambda v: f"{v:.1f}%")
         st.dataframe(compare_table, use_container_width=True, hide_index=True)
 
 with tabs[3]:
     st.subheader("시장 흐름")
 
+    def _fmt_pyeong_price(val):
+        """평당가(만원 단위)를 자연스럽게 표시."""
+        if not val:
+            return "-"
+        v = float(val)
+        if v >= 10000:
+            return f"{v/10000:.1f}억/평"
+        return f"{v:,.0f}만/평"
+
+    # ══════════════════════════════════════════════════════════════════
+    # SECTION 1 — 서울 시장 전체 (AI_AGG 브리핑 + TOP 리스트)
+    # ══════════════════════════════════════════════════════════════════
+    st.markdown(
+        f'<div style="display:flex;align-items:center;gap:8px;margin:0.2rem 0 0.8rem">'
+        f'{_icon("public", 22, "#1a2740")}'
+        f'<span style="font-size:1.05rem;font-weight:700;color:#1a2740">서울 전체 시장 한눈에</span>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+    # `briefing`은 lazy 로딩 — 1차 렌더 시점엔 None일 수 있음
+    import html as _html
+    if briefing is None:
+        # 1차 렌더 — 브리핑 로딩 중. 카드 자리에 로딩 placeholder만 표시
+        st.markdown(
+            _ai_loading_card_html(
+                "AI가 서울 288개 동의 시장 흐름을 분석하고 있습니다. 잠시만 기다려 주세요."
+            ),
+            unsafe_allow_html=True,
+        )
+        st.markdown('<div style="height:0.6rem"></div>', unsafe_allow_html=True)
+
+    headline = (briefing or {}).get("headline", "") or ""
+    headline = headline.strip()
+    market_mood = (briefing or {}).get("market_mood", "") or ""
+    market_mood = market_mood.strip()
+    watch_areas = (briefing or {}).get("watch_areas", []) or []
+    opp_areas = (briefing or {}).get("opportunity_areas", []) or []
+    user_action = ((briefing or {}).get("user_action") or "").strip()
+    profile_for_briefing = (briefing or {}).get("user_profile", survey_result["profile"])
+
+    if market_mood and not market_mood.startswith("__ERROR__"):
+        # 헤드라인 + 분위기 (히어로)
+        hero_html = (
+            f'<div style="background:linear-gradient(135deg,#f7faf8 0%,#eef5f1 100%);'
+            f'border:1px solid #d4e4dc;border-radius:14px;padding:1.6rem 1.7rem 1.4rem;'
+            f'margin-bottom:1.2rem">'
+            f'<div style="display:flex;align-items:center;justify-content:space-between;'
+            f'gap:0.5rem;margin-bottom:0.8rem;flex-wrap:wrap">'
+            f'<div style="display:flex;align-items:center;gap:8px">'
+            f'{_icon("auto_awesome", 22, "#2d7a52")}'
+            f'<span style="font-size:0.78rem;font-weight:700;color:#2d7a52;'
+            f'text-transform:uppercase;letter-spacing:0.05em">'
+            f'이달의 서울 전세시장 AI 브리핑</span>'
+            f'</div>'
+            f'<span style="background:#fff;border:1px solid #d4e4dc;color:#3a5347;'
+            f'padding:3px 11px;border-radius:999px;font-size:0.72rem;font-weight:600">'
+            f'{_html.escape(profile_for_briefing)} 맞춤</span>'
+            f'</div>'
+        )
+        if headline:
+            hero_html += (
+                f'<h2 style="margin:0.2rem 0 0.7rem;color:#1a1a1a;font-size:1.45rem;'
+                f'font-weight:700;letter-spacing:-0.5px;line-height:1.3">'
+                f'{_html.escape(headline)}</h2>'
+            )
+        hero_html += (
+            f'<div style="font-size:1.0rem;line-height:1.75;color:#1a1a1a;font-weight:500">'
+            f'{_html.escape(market_mood)}</div>'
+            f'</div>'
+        )
+        st.markdown(hero_html, unsafe_allow_html=True)
+
+        # 주의 / 기회 2분할
+        def _section_card(title: str, icon: str, accent: str, items: list, empty_msg: str) -> str:
+            inner = ""
+            if items:
+                for it in items[:2]:
+                    area = _html.escape(str(it.get("area", "")).strip())
+                    why = _html.escape(str(it.get("why", "")).strip())
+                    if not area:
+                        continue
+                    inner += (
+                        f'<div style="background:#fff;border:1px solid #ecefef;border-radius:10px;'
+                        f'padding:0.85rem 1rem;margin-top:0.55rem">'
+                        f'<div style="display:flex;align-items:center;gap:6px;margin-bottom:0.35rem">'
+                        f'<span style="display:inline-block;width:6px;height:6px;border-radius:50%;'
+                        f'background:{accent}"></span>'
+                        f'<span style="font-size:0.92rem;font-weight:700;color:#1a1a1a">{area}</span>'
+                        f'</div>'
+                        f'<div style="font-size:0.87rem;color:#4a4a4a;line-height:1.55">{why}</div>'
+                        f'</div>'
+                    )
+            if not inner:
+                inner = (
+                    f'<div style="color:#999;font-size:0.85rem;padding:0.6rem 0">{empty_msg}</div>'
+                )
+
+            return (
+                f'<div style="background:#fafbfc;border:1px solid #eef0f3;border-radius:12px;'
+                f'padding:1.1rem 1.2rem;height:100%">'
+                f'<div style="display:flex;align-items:center;gap:6px">'
+                f'{_icon(icon, 18, accent)}'
+                f'<span style="font-size:0.92rem;font-weight:700;color:{accent};'
+                f'text-transform:uppercase;letter-spacing:0.04em">{title}</span>'
+                f'</div>'
+                f'{inner}'
+                f'</div>'
+            )
+
+        col_w, col_o = st.columns(2)
+        with col_w:
+            st.markdown(
+                _section_card("이번 달 주의 신호", "warning", "#c62828", watch_areas, "특별한 주의 신호 없음"),
+                unsafe_allow_html=True,
+            )
+        with col_o:
+            st.markdown(
+                _section_card("지금 눈여겨볼 곳", "lightbulb", "#1565c0", opp_areas, "주목할 기회 없음"),
+                unsafe_allow_html=True,
+            )
+
+        # 사용자 액션
+        if user_action:
+            st.markdown(
+                f'<div style="background:#1a2740;border-radius:12px;padding:1.1rem 1.3rem;'
+                f'margin-top:1rem;display:flex;align-items:flex-start;gap:10px">'
+                f'{_icon("rocket_launch", 20, "#ffd166")}'
+                f'<div>'
+                f'<div style="font-size:0.7rem;font-weight:700;color:#ffd166;'
+                f'text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.25rem">'
+                f'{_html.escape(profile_for_briefing)} · 지금 할 일</div>'
+                f'<div style="font-size:0.97rem;color:#fff;line-height:1.6;font-weight:500">'
+                f'{_html.escape(user_action)}</div>'
+                f'</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+        st.markdown(
+            f'<div style="margin-top:0.8rem;font-size:0.72rem;color:#7a8b82;'
+            f'display:flex;align-items:center;gap:5px">'
+            f'{_icon("bolt", 13, "#2d7a52")}'
+            f'<span>Powered by Snowflake Cortex AI_AGG · 288개 동 단일 쿼리 요약 · 성향별 맞춤 분석 · 1시간 캐시</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown('<div style="height:1.4rem"></div>', unsafe_allow_html=True)
+    elif market_mood.startswith("__ERROR__"):
+        st.caption(f"AI 브리핑을 불러오지 못했습니다 ({market_mood.replace('__ERROR__:', '')[:80]})")
+
+    # ── TOP 리스트 3분할 (위험 / 안전 / 활발) ──
+    def _render_top_list(title: str, icon: str, accent: str, items: list, kind: str):
+        if not items:
+            return (
+                f'<div style="background:#fafbfc;border:1px solid #eef0f3;border-radius:12px;'
+                f'padding:1rem 1.1rem;height:100%">'
+                f'<div style="display:flex;align-items:center;gap:6px;margin-bottom:0.6rem">'
+                f'{_icon(icon, 18, accent)}'
+                f'<span style="font-size:0.92rem;font-weight:700;color:#1a1a1a">{title}</span>'
+                f'</div>'
+                f'<div style="color:#999;font-size:0.85rem">데이터 없음</div>'
+                f'</div>'
+            )
+
+        rows_html = ""
+        for i, item in enumerate(items[:5], 1):
+            area = item["area"]
+            grade = item["grade"] or "-"
+            if kind == "risk":
+                metric_label = f"전세가율 {item['metric_a']}%"
+            elif kind == "safe":
+                metric_label = f"안전점수 {item['metric_a']}"
+            else:  # active
+                metric_label = f"거래 {int(item['metric_a'])}건"
+
+            rows_html += (
+                f'<div style="display:flex;align-items:center;justify-content:space-between;'
+                f'padding:0.55rem 0;border-bottom:1px solid #f0f2f5">'
+                f'<div style="display:flex;align-items:center;gap:8px;min-width:0">'
+                f'<span style="font-size:0.78rem;color:#999;width:14px;flex-shrink:0">{i}</span>'
+                f'<span style="font-size:0.88rem;color:#1a1a1a;font-weight:600;'
+                f'white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{area}</span>'
+                f'<span style="font-size:0.7rem;font-weight:700;color:{accent};'
+                f'background:{accent}1A;padding:1px 6px;border-radius:8px;flex-shrink:0">{grade}</span>'
+                f'</div>'
+                f'<span style="font-size:0.78rem;color:#666;flex-shrink:0;margin-left:8px">{metric_label}</span>'
+                f'</div>'
+            )
+
+        return (
+            f'<div style="background:#fff;border:1px solid #eef0f3;border-radius:12px;'
+            f'padding:1.1rem 1.2rem;height:100%;box-shadow:0 1px 3px rgba(0,0,0,0.02)">'
+            f'<div style="display:flex;align-items:center;gap:6px;margin-bottom:0.7rem">'
+            f'{_icon(icon, 18, accent)}'
+            f'<span style="font-size:0.92rem;font-weight:700;color:#1a1a1a">{title}</span>'
+            f'</div>'
+            f'{rows_html}'
+            f'</div>'
+        )
+
+    col_r, col_s, col_a = st.columns(3)
+    with col_r:
+        st.markdown(
+            _render_top_list("주의가 필요한 동 TOP", "warning", "#c62828", market_rankings.get("risk", []), "risk"),
+            unsafe_allow_html=True,
+        )
+    with col_s:
+        st.markdown(
+            _render_top_list("안전한 동 TOP", "verified", "#2e7d32", market_rankings.get("safe", []), "safe"),
+            unsafe_allow_html=True,
+        )
+    with col_a:
+        st.markdown(
+            _render_top_list("거래 활발한 동 TOP", "trending_up", "#1565c0", market_rankings.get("active", []), "active"),
+            unsafe_allow_html=True,
+        )
+
+    st.markdown('<div style="height:1.8rem"></div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div style="border-top:1px dashed #e0e3e8;margin-bottom:1.4rem"></div>',
+        unsafe_allow_html=True,
+    )
+
+    # ══════════════════════════════════════════════════════════════════
+    # SECTION 2 — 선택한 동 상세
+    # ══════════════════════════════════════════════════════════════════
+    st.markdown(
+        f'<div style="display:flex;align-items:center;gap:8px;margin:0.2rem 0 0.9rem">'
+        f'{_icon("location_on", 22, "#1a2740")}'
+        f'<span style="font-size:1.05rem;font-weight:700;color:#1a2740">{selected_area} 상세 분석</span>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
     if selected_history_df.empty:
         st.info("선택한 후보의 시세 데이터가 없습니다.")
     else:
-        def _fmt_pyeong_price(val):
-            """평당가(만원 단위)를 자연스럽게 표시."""
-            if not val:
-                return "-"
-            v = float(val)
-            if v >= 10000:
-                return f"{v/10000:.1f}억/평"
-            return f"{v:,.0f}만/평"
-
         metric_1, metric_2, metric_3, metric_4 = st.columns(4)
         metric_1.metric("기준월", str(market_snapshot.get("latest_month", "-")))
         metric_2.metric(
@@ -1231,15 +1872,19 @@ with tabs[3]:
         )
 
         st.caption(build_market_flow_summary(selected_area, market_snapshot))
-        st.markdown(f"**{selected_area}** 매매가·전세가 추이")
+        st.markdown(
+            f'<div style="margin:0.9rem 0 0.4rem;font-size:0.92rem;font-weight:600;color:#444">'
+            f'{selected_area} 매매가·전세가 추이</div>',
+            unsafe_allow_html=True,
+        )
         st.altair_chart(make_history_chart(selected_history_df), use_container_width=True)
 
     # ── 최근 실거래 내역 ──
-    st.markdown('<div class="section-gap"></div>', unsafe_allow_html=True)
+    st.markdown('<div style="height:1.6rem"></div>', unsafe_allow_html=True)
     st.markdown(
         f'<div style="display:flex;align-items:center;gap:6px;margin-bottom:0.5rem">'
-        f'{_icon("receipt_long", 22, "#1a1a1a")}'
-        f'<span style="font-size:1.05rem;font-weight:700;color:#1a1a1a">{selected_area} 최근 실거래</span>'
+        f'{_icon("receipt_long", 20, "#1a1a1a")}'
+        f'<span style="font-size:0.98rem;font-weight:700;color:#1a1a1a">{selected_area} 최근 실거래</span>'
         f"</div>",
         unsafe_allow_html=True,
     )
@@ -1255,17 +1900,17 @@ with tabs[3]:
 
         raw_tx["거래가(만원)"] = raw_tx["거래가(만원)"].apply(lambda v: f"{v:,.0f}" if pd.notna(v) else "-")
         raw_tx["평당가(만원)"] = raw_tx["평당가(만원)"].apply(lambda v: f"{v:,.0f}" if pd.notna(v) else "-")
-        st.dataframe(raw_tx, use_container_width=True, hide_index=True, height=350)
+        st.dataframe(raw_tx, use_container_width=True, hide_index=True, height=320)
         st.caption(f"총 {len(raw_tx)}건 · 매매=매매가, 전세=보증금 (단위: 만원)")
 
     # ── 단지별 비교 ──
-    st.markdown('<div class="section-gap"></div>', unsafe_allow_html=True)
+    st.markdown('<div style="height:1.6rem"></div>', unsafe_allow_html=True)
     st.markdown(
-        f'<div style="display:flex;align-items:center;gap:6px;margin-bottom:0.5rem">'
-        f'{_icon("apartment", 22, "#1a1a1a")}'
-        f'<span style="font-size:1.05rem;font-weight:700;color:#1a1a1a">{selected_area} 단지별 시세</span>'
+        f'<div style="display:flex;align-items:center;gap:6px;margin-bottom:0.4rem">'
+        f'{_icon("apartment", 20, "#1a1a1a")}'
+        f'<span style="font-size:0.98rem;font-weight:700;color:#1a1a1a">{selected_area} 단지별 시세</span>'
         f"</div>"
-        f'<p style="color:#888;font-size:0.85rem;margin:0 0 0.5rem">'
+        f'<p style="color:#888;font-size:0.82rem;margin:0 0 0.5rem">'
         f"최근 6개월 거래 기준, 단지별 매매·전세 중위가격을 비교합니다.</p>",
         unsafe_allow_html=True,
     )
@@ -1285,6 +1930,133 @@ with tabs[3]:
         complex_df = complex_df.fillna("-")
         st.dataframe(complex_df, use_container_width=True, hide_index=True)
         st.caption(f"총 {len(complex_df)}개 단지")
+
+with tabs[4]:
+    # ── AI 질문 (Cortex Analyst) ──
+    st.markdown(
+        f'<div style="display:flex;align-items:center;gap:8px;margin-bottom:0.3rem">'
+        f'{_icon("psychology", 26, "#2d7a52")}'
+        f'<span style="font-size:1.3rem;font-weight:700;color:#1a1a1a">AI에게 물어보기</span>'
+        f'</div>'
+        f'<p style="color:#666;font-size:0.9rem;margin:0 0 1rem;line-height:1.5">'
+        f'궁금한 질문을 클릭하면 AI가 분석해서 답해드려요.'
+        f'</p>',
+        unsafe_allow_html=True,
+    )
+
+    # 추천 질문 카드
+    preset_questions = [
+        ("🏆", "가장 안전한 동 TOP 10", "서울에서 가장 안전한 동 10개를 안전점수가 높은 순으로 알려줘"),
+        ("📍", f"{selected_sgg} 안전 동", f"{selected_sgg}에서 안전등급 A 또는 B인 동을 알려줘"),
+        ("📊", "구별 평균 안전점수", "구별 평균 안전점수가 높은 순서로 보여줘"),
+        ("💰", "전세가율 낮은 동", "전세가율이 30% 이하인 동을 전세가율 낮은 순으로 알려줘"),
+        ("📈", "거래 활발한 동", "최근 거래가 가장 활발한 동 10개를 알려줘"),
+        ("🤖", "AI 위험 예측 동", "AI가 가장 위험하다고 예측한 동 10개를 알려줘"),
+        ("🥇", "구별 1등 동", "각 구에서 안전점수가 가장 높은 동을 알려줘"),
+        ("⚠️", "깡통전세 위험", "전세가율이 80% 이상인 동을 알려줘"),
+    ]
+
+    if "_analyst_question" not in st.session_state:
+        st.session_state["_analyst_question"] = None
+
+    cols_per_row = 4
+    rows = [preset_questions[i:i + cols_per_row] for i in range(0, len(preset_questions), cols_per_row)]
+    for row in rows:
+        cols = st.columns(len(row))
+        for i, (icon, title, q) in enumerate(row):
+            with cols[i]:
+                if st.button(
+                    f"{icon}\n\n**{title}**",
+                    key=f"_analyst_q_{title}",
+                    use_container_width=True,
+                ):
+                    st.session_state["_analyst_question"] = q
+
+    st.markdown('<div class="section-gap"></div>', unsafe_allow_html=True)
+
+    selected_question = st.session_state.get("_analyst_question")
+    if selected_question:
+        st.markdown(
+            f'<div style="background:#f0f7f3;border-left:4px solid #2d7a52;padding:0.8rem 1.2rem;'
+            f'border-radius:8px;margin-bottom:0.8rem">'
+            f'<div style="font-size:0.75rem;color:#888;font-weight:600;text-transform:uppercase;letter-spacing:0.05em;'
+            f'margin-bottom:0.3rem">회원님의 질문</div>'
+            f'<div style="font-size:1rem;color:#1a1a1a;font-weight:600">{selected_question}</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+        _analyst_slot = st.empty()
+        _analyst_slot.markdown(
+            _ai_loading_card_html("Cortex Analyst가 질문을 SQL로 변환 중이에요..."),
+            unsafe_allow_html=True,
+        )
+        result = run_analyst_question(session, selected_question)
+        _analyst_slot.empty()
+
+        if "error" in result:
+            st.error(f"분석 실패: {result['error']}")
+        else:
+            df = result.get("df")
+
+            if df is not None and not df.empty:
+                # 컬럼명을 한글로 매핑
+                column_map = {
+                    "SGG": "구",
+                    "EMD": "동",
+                    "GRADE": "안전등급",
+                    "TOTAL_SCORE": "안전점수",
+                    "JEONSE_RATE": "전세가율 (%)",
+                    "JEONSE_LATEST": "평당 전세가 (만원)",
+                    "MEME_LATEST": "평당 매매가 (만원)",
+                    "JEONSE_DROP_PCT": "전세 변동률 (%)",
+                    "NET_MIG": "최근 거래 건수",
+                    "TX_COUNT": "최근 거래 건수",
+                    "SUBWAY_DIST": "변동성",
+                    "S_RATE": "전세가율 점수",
+                    "S_MIG": "거래 활발도",
+                    "S_SUB": "가격 안정성",
+                    "ML_RISK_SCORE": "AI 하락 위험도 (%)",
+                    "ML_DROP_PROB": "AI 하락 확률",
+                    "AVG_SCORE": "평균 안전점수",
+                    "AREA_COUNT": "동 개수",
+                    "HUG_RATE": "HUG 사고율 (%)",
+                }
+                df_display = df.rename(columns=column_map)
+                # 안전등급 보기 좋게
+                if "안전등급" in df_display.columns:
+                    df_display["안전등급"] = df_display["안전등급"].apply(
+                        lambda g: f"{g}등급 ({GRADE_MEANINGS.get(g, '')})" if pd.notna(g) and g in GRADE_MEANINGS else g
+                    )
+
+                st.markdown(
+                    f'<div style="display:flex;align-items:center;gap:6px;margin-bottom:0.4rem">'
+                    f'{_icon("insights", 18, "#2d7a52")}'
+                    f'<span style="font-size:0.95rem;font-weight:700;color:#1a1a1a">결과</span>'
+                    f'<span style="font-size:0.78rem;color:#888">총 {len(df)}건</span>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+                st.dataframe(df_display, use_container_width=True, hide_index=True)
+            else:
+                st.info("결과가 없습니다.")
+    else:
+        st.info("👆 위 추천 질문 중 하나를 클릭하면 AI가 분석을 시작합니다.")
+
+# ──────────────────────────────────────────────────────────────────────
+# 2-pass lazy AI 로딩의 2단계
+# 모든 탭이 1차 렌더되어 사용자가 추천 결과를 볼 수 있는 상태에서,
+# 백그라운드로 두 AI 호출을 병렬 실행하고 완료되면 st.rerun()으로 새로고침.
+# 두 번째 렌더는 캐시 hit이라 즉시 응답.
+# ──────────────────────────────────────────────────────────────────────
+if not _ai_warm:
+    with ThreadPoolExecutor(max_workers=2) as _ai_pool:
+        _f_a = _ai_pool.submit(get_ai_structured_analysis, session, _ai_cache_key, cortex_prompt)
+        _f_b = _ai_pool.submit(load_market_briefing, session, survey_result["profile"])
+        _f_a.result()
+        _f_b.result()
+    st.session_state["_ai_warm_key"] = _ai_cache_key
+    st.rerun()
 
 # ── 안내 문구 ──
 st.divider()

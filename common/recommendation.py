@@ -433,24 +433,39 @@ def build_recommendation_dataset(
         + df["LIFESTYLE_FIT_SCORE"] * lifestyle_weight
     ).round(1)
 
-    # 하이브리드 추천점수: 룰 기반(80%) + ML 위험 예측(20%)
-    # 룰 기반: 안전점수 - 손실패널티 - 과열패널티 + 선호적합도 + 유사도
-    rule_score = (
-        df["SAFETY_SCORE"] * 0.50
-        - df["LOSS_PENALTY_SCORE"] * 0.15 * alpha
-        - df["PRICE_OVERHEAT_PENALTY_SCORE"] * 0.10 * beta
-        + df["PREFERENCE_FIT_SCORE"] * 0.15 * gamma
-        + df["SIMILARITY_SCORE"] * 0.10 * delta
+    # 하이브리드 추천점수
+    # 룰 기반: 가중평균 (합 = 1.0) → 안전 60% + 손실회피 15% + 가격적정 5% + 선호적합 12% + 유사도 8%
+    # 모든 항목이 100점이면 룰 점수도 100점, 0점이면 0점 (절대 점수)
+    # 성향(α/β/γ/δ)은 원래 가중치에 곱해지지만 합이 1.0 유지되도록 정규화
+    base_weights = {"safety": 0.60, "loss": 0.15, "price": 0.05, "pref": 0.12, "sim": 0.08}
+    w_loss = base_weights["loss"] * alpha
+    w_price = base_weights["price"] * beta
+    w_pref = base_weights["pref"] * gamma
+    w_sim = base_weights["sim"] * delta
+    w_total = base_weights["safety"] + w_loss + w_price + w_pref + w_sim
+    # 정규화: 합이 1.0이 되도록
+    w_safety_n = base_weights["safety"] / w_total
+    w_loss_n = w_loss / w_total
+    w_price_n = w_price / w_total
+    w_pref_n = w_pref / w_total
+    w_sim_n = w_sim / w_total
+
+    raw_rule = (
+        df["SAFETY_SCORE"] * w_safety_n
+        + (100 - df["LOSS_PENALTY_SCORE"]) * w_loss_n
+        + (100 - df["PRICE_OVERHEAT_PENALTY_SCORE"]) * w_price_n
+        + df["PREFERENCE_FIT_SCORE"] * w_pref_n
+        + df["SIMILARITY_SCORE"] * w_sim_n
     ).clip(0, 100)
 
     # ML: ML_RISK_SCORE가 높을수록 위험 → (100 - ML_RISK_SCORE)가 안전 점수
     ml_safety = (100 - df["ML_RISK_SCORE"].fillna(50)).clip(0, 100)
 
-    df["RULE_SCORE"] = rule_score.round(1)
+    # 최종 추천점수: 룰(80%) + ML(20%)
+    # 유저가 보는 round된 RULE_SCORE/ML_SAFETY_SCORE로 계산해서 일관성 보장
+    df["RULE_SCORE"] = raw_rule.round(1)
     df["ML_SAFETY_SCORE"] = ml_safety.round(1)
-    df["RECOMMENDATION_SCORE"] = (
-        rule_score * 0.80 + ml_safety * 0.20
-    ).clip(0, 100).round(1)
+    df["RECOMMENDATION_SCORE"] = (df["RULE_SCORE"] * 0.80 + df["ML_SAFETY_SCORE"] * 0.20).clip(0, 100).round(1)
 
     df["PROFILE"] = survey_result["profile"]
     df["ALPHA"] = alpha
@@ -544,35 +559,23 @@ def build_card_description(
     """추천 카드에 표시할 핵심 개선 포인트 리스트를 반환한다."""
     points: List[str] = []
 
-    delta = float(row["VS_CANDIDATE_DELTA"])
-    if delta > 0:
-        points.append(f"현재 후보보다 종합 점수 **+{delta:.1f}점**")
-
-    loss_diff = float(candidate_row["LOSS_EXPOSURE_AMOUNT"]) - float(row["LOSS_EXPOSURE_AMOUNT"])
-    if loss_diff > 0:
-        points.append(f"입력 보증금 기준 손실 노출 **{format_currency_krw(loss_diff)} 감소**")
-
     cand_rate = float(candidate_row.get("JEONSE_RATE", 0))
     row_rate = float(row.get("JEONSE_RATE", 0))
     if cand_rate > 0 and row_rate < cand_rate:
-        points.append(f"전세가율 **{cand_rate:.1f}% → {row_rate:.1f}%**로 가격 부담 완화")
+        points.append(f"전세가율 {cand_rate:.1f}% → **{row_rate:.1f}%**로 더 낮음")
 
     grade_order = {"A": 0, "B": 1, "C": 2, "D": 3}
     if grade_order.get(str(row.get("GRADE", "")), 9) < grade_order.get(str(candidate_row.get("GRADE", "")), 9):
-        points.append(f"안전등급 **{row['GRADE']}** (현재 후보 {candidate_row['GRADE']})")
+        points.append(f"안전등급 **{row['GRADE']}**로 더 안전")
 
     if str(row.get("SGG", "")) == str(candidate_row.get("SGG", "")):
-        points.append("현재 관심 구 **생활권 유지**")
-
-    pref_diff = float(row.get("PREFERENCE_FIT_SCORE", 0)) - float(candidate_row.get("PREFERENCE_FIT_SCORE", 0))
-    if pref_diff > 5:
-        points.append(f"생활권 적합도 **+{pref_diff:.1f}점** 개선")
+        points.append("같은 구라 **생활권 유지**")
 
     bucket_count = row.get("BUCKET_RENT_COUNT", 0)
-    if bucket_count and bucket_count >= 5:
-        points.append(f"해당 평형대 최근 6개월 전세 거래 **{int(bucket_count)}건**")
+    if bucket_count and bucket_count >= 10:
+        points.append(f"최근 6개월 거래 **{int(bucket_count)}건**으로 활발함")
 
-    return points[:5]
+    return points[:4]
 
 
 def build_candidate_summary(row: pd.Series, survey_result: Dict[str, Any]) -> str:
@@ -626,54 +629,69 @@ def build_recommendation_reasons(
 
 
 def build_exclusion_reasons(row: pd.Series, candidate_row: pd.Series) -> List[str]:
-    """해당 지역이 추천 대안에서 제외된 이유를 반환한다."""
+    """해당 지역이 추천 대안에서 제외된 다양한 이유를 반환한다."""
     reasons: List[str] = []
 
-    # 필터 조건
+    # 1. 예산 초과
     if not row.get("BUDGET_BAND_MATCH", True):
         reasons.append(
-            f"추정 전세가({format_currency_krw(row['ESTIMATED_TOTAL_JEONSE'])})가 "
-            f"입력 보증금보다 높음"
+            f"💰 예상 전세가가 {format_currency_krw(row['ESTIMATED_TOTAL_JEONSE'])}로 보증금 한도를 초과"
         )
 
+    # 2. 탐색 범위 밖
     if not row.get("AREA_SCOPE_MATCH", True):
-        reasons.append("설정한 탐색 범위(구/생활권) 밖")
+        reasons.append("📍 설정한 탐색 범위(구/생활권) 밖에 있음")
 
+    # 3. 거래 부족
     if not row.get("HAS_ENOUGH_TX", True):
-        reasons.append(f"최근 거래가 {int(row.get('NET_MIG', 0))}건으로 데이터가 부족함")
+        tx_count = int(row.get('NET_MIG', 0))
+        reasons.append(f"📉 최근 6개월 거래 {tx_count}건뿐이라 시세 신뢰도 낮음")
 
+    # 4. 절대 위험
     if not row.get("NOT_ABSOLUTE_RISK", True):
-        reasons.append(f"전세가율 {row.get('JEONSE_RATE', 0):.1f}%로 절대 위험 기준 초과")
+        rate = float(row.get('JEONSE_RATE', 0))
+        reasons.append(f"⚠️ 전세가율 {rate:.1f}%로 깡통전세 위험 구간")
 
-    # 안전 등급
+    # 5. 안전 등급 낮음
     cand_grade = str(candidate_row.get("GRADE", ""))
     row_grade = str(row.get("GRADE", ""))
     grade_order = {"A": 0, "B": 1, "C": 2, "D": 3}
     if grade_order.get(row_grade, 0) > grade_order.get(cand_grade, 0):
         reasons.append(
-            f"안전등급 {row_grade}({GRADE_MEANINGS.get(row_grade, '')})로 "
-            f"현재 후보({cand_grade})보다 낮음"
+            f"🏷️ 안전등급 {row_grade}({GRADE_MEANINGS.get(row_grade, '')})로 현재 후보({cand_grade})보다 낮음"
         )
 
-    # 추천점수
+    # 6. 적합도 낮음
     if float(row["RECOMMENDATION_SCORE"]) <= float(candidate_row["RECOMMENDATION_SCORE"]):
         delta = float(candidate_row["RECOMMENDATION_SCORE"]) - float(row["RECOMMENDATION_SCORE"])
-        reasons.append(f"최종 추천점수가 현재 후보보다 {delta:.1f}점 낮음")
+        if delta > 0.5:
+            reasons.append(f"📊 적합도가 현재 후보보다 {delta:.1f}점 낮음")
 
-    # 손실 노출
-    if float(row["LOSS_EXPOSURE_AMOUNT"]) > float(candidate_row["LOSS_EXPOSURE_AMOUNT"]):
-        diff = float(row["LOSS_EXPOSURE_AMOUNT"]) - float(candidate_row["LOSS_EXPOSURE_AMOUNT"])
-        reasons.append(f"예상 손실 노출이 {format_currency_krw(diff)} 더 높음")
-
-    # 전세가율 과열
+    # 7. 전세가율 부담
     jeonse_rate = float(row.get("JEONSE_RATE", 0))
-    if jeonse_rate > 80:
-        reasons.append(f"전세가율 {jeonse_rate:.1f}%로 가격 부담이 큼")
+    cand_rate = float(candidate_row.get("JEONSE_RATE", 0))
+    if 70 < jeonse_rate <= 90 and jeonse_rate > cand_rate + 5:
+        reasons.append(f"💸 전세가율 {jeonse_rate:.1f}%로 매매가 대비 전세가가 부담스러운 수준")
 
-    # 과거 가격 하락 이력
+    # 8. AI 하락 위험도 높음
+    ml_risk = float(row.get("ML_RISK_SCORE", 50))
+    cand_ml = float(candidate_row.get("ML_RISK_SCORE", 50))
+    if ml_risk > 60 and ml_risk > cand_ml + 10:
+        reasons.append(f"🤖 AI 예측 하락 위험도 {ml_risk:.0f}%로 향후 6개월 가격 하락 가능성 큼")
+
+    # 9. 과거 가격 변동성
     backtest = float(row.get("BACKTEST_SCORE", 50))
     cand_backtest = float(candidate_row.get("BACKTEST_SCORE", 50))
     if backtest < 30 and backtest < cand_backtest:
-        reasons.append("과거 전세가 하락폭이 커서 가격 안정성이 낮음")
+        reasons.append("📈 과거 전세가 변동폭이 커서 가격 안정성 부족")
 
-    return reasons[:4]
+    # 10. 평형대 거래 부족 (해당 평형 데이터 없음)
+    bucket_count = row.get("BUCKET_RENT_COUNT", None)
+    if bucket_count is not None and bucket_count < 5:
+        reasons.append("🏠 해당 평형대 최근 거래가 적어 시세 추정 정확도 낮음")
+
+    # 11. 다른 구
+    if str(row.get("SGG", "")) != str(candidate_row.get("SGG", "")):
+        reasons.append(f"🚇 현재 관심 구({candidate_row.get('SGG', '')})와 다른 지역")
+
+    return reasons[:5]

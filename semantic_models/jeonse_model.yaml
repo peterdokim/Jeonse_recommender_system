@@ -1,0 +1,210 @@
+name: jeonse_safety
+description: 서울 25개 구의 동별 전세 안전성, 시세, 거래량, AI 위험 예측 데이터. 한국 부동산 전세 추천 시스템.
+
+tables:
+  - name: jeonse_score
+    description: 서울 동별 최신 전세 시세, 안전 점수, 등급 정보
+    base_table:
+      database: HACKATHON_APP
+      schema: RESILIENCE
+      table: JEONSE_SAFETY_SCORE
+    primary_key:
+      columns: [SGG, EMD]
+
+    dimensions:
+      - name: sgg
+        expr: SGG
+        description: 서울시 자치구 (구)
+        data_type: varchar
+        synonyms: ["구", "자치구", "관할구", "지역"]
+        sample_values:
+          [
+            "강남구",
+            "강동구",
+            "강북구",
+            "강서구",
+            "관악구",
+            "광진구",
+            "구로구",
+            "금천구",
+            "노원구",
+            "도봉구",
+            "동대문구",
+            "동작구",
+            "마포구",
+            "서대문구",
+            "서초구",
+            "성동구",
+            "성북구",
+            "송파구",
+            "양천구",
+            "영등포구",
+            "용산구",
+            "은평구",
+            "종로구",
+            "중구",
+            "중랑구",
+          ]
+
+      - name: emd
+        expr: EMD
+        description: 법정동 이름 (예 대치동, 잠실동)
+        data_type: varchar
+        synonyms: ["동", "법정동", "동네", "행정동"]
+
+      - name: grade
+        expr: GRADE
+        description: 안전 등급 (A 가장 안전, D 가장 위험)
+        data_type: varchar
+        synonyms: ["등급", "안전등급", "안전 등급"]
+        sample_values: ["A", "B", "C", "D"]
+
+    measures:
+      - name: total_score
+        expr: TOTAL_SCORE
+        description: 종합 안전 점수 (0~100, 높을수록 안전)
+        data_type: number
+        synonyms: ["안전점수", "종합점수", "안전 점수"]
+
+      - name: jeonse_rate
+        expr: JEONSE_RATE
+        description: 전세가율 (전세가 ÷ 매매가 × 100, 낮을수록 안전, 90% 초과 시 깡통전세 위험)
+        data_type: number
+        synonyms: ["전세가율", "전세 비율", "전세 대비"]
+
+      - name: jeonse_drop_pct
+        expr: JEONSE_DROP_PCT
+        description: 12개월 전세가 변동률 (음수 하락, 양수 상승)
+        data_type: number
+        synonyms: ["전세 변동률", "전세 하락률"]
+
+      - name: meme_latest
+        expr: MEME_LATEST
+        description: 최근 평당 매매가 (단위 만원)
+        data_type: number
+        synonyms: ["매매가", "평당 매매가"]
+
+      - name: jeonse_latest
+        expr: JEONSE_LATEST
+        description: 최근 평당 전세가 (단위 만원)
+        data_type: number
+        synonyms: ["전세가", "평당 전세가"]
+
+      - name: net_mig
+        expr: NET_MIG
+        description: 최근 6개월 거래 건수 (높을수록 거래 활발)
+        data_type: number
+        synonyms: ["거래량", "거래 건수", "거래활발도"]
+
+      - name: subway_dist
+        expr: SUBWAY_DIST
+        description: 12개월 전세가율 변동성 표준편차 (낮을수록 안정)
+        data_type: number
+        synonyms: ["변동성", "가격 안정성", "안정성"]
+
+      - name: s_rate
+        expr: S_RATE
+        description: 전세가율 점수 (백분위, 높을수록 안전)
+        data_type: number
+
+      - name: s_mig
+        expr: S_MIG
+        description: 거래 활발도 점수 (백분위)
+        data_type: number
+
+      - name: s_sub
+        expr: S_SUB
+        description: 가격 안정성 점수 (백분위)
+        data_type: number
+
+  - name: ml_risk
+    description: 6개월 후 전세가 하락 위험 AI 예측 점수
+    base_table:
+      database: HACKATHON_APP
+      schema: RESILIENCE
+      table: ML_RISK_SCORES
+    primary_key:
+      columns: [SGG, EMD]
+
+    dimensions:
+      - name: sgg
+        expr: SGG
+        data_type: varchar
+      - name: emd
+        expr: EMD
+        data_type: varchar
+
+    measures:
+      - name: ml_risk_score
+        expr: ML_RISK_SCORE
+        description: AI 모델이 예측한 6개월 내 전세가 5% 이상 하락 확률 (0~100, 낮을수록 안전)
+        data_type: number
+        synonyms: ["AI 위험도", "AI 하락 위험도", "AI 예측", "ML 점수"]
+
+      - name: ml_drop_prob
+        expr: ML_DROP_PROB
+        description: 하락 확률 원본 값 (0~1)
+        data_type: number
+
+relationships:
+  - name: score_to_ml
+    left_table: jeonse_score
+    right_table: ml_risk
+    relationship_columns:
+      - left_column: SGG
+        right_column: SGG
+      - left_column: EMD
+        right_column: EMD
+    join_type: left_outer
+    relationship_type: one_to_one
+
+verified_queries:
+  - name: "안전한 동 TOP 5"
+    question: "서울에서 가장 안전한 동 5개 알려줘"
+    sql: |
+      SELECT SGG, EMD, TOTAL_SCORE, GRADE, JEONSE_RATE
+      FROM HACKATHON_APP.RESILIENCE.JEONSE_SAFETY_SCORE
+      ORDER BY TOTAL_SCORE DESC
+      LIMIT 5
+
+  - name: "특정 구 안전 동"
+    question: "강남구에서 안전등급 A인 동 알려줘"
+    sql: |
+      SELECT SGG, EMD, TOTAL_SCORE, GRADE, JEONSE_RATE, JEONSE_LATEST
+      FROM HACKATHON_APP.RESILIENCE.JEONSE_SAFETY_SCORE
+      WHERE SGG = '강남구' AND GRADE = 'A'
+      ORDER BY TOTAL_SCORE DESC
+
+  - name: "거래 활발한 동"
+    question: "최근 거래가 가장 활발한 동 10개"
+    sql: |
+      SELECT SGG, EMD, NET_MIG AS TX_COUNT, TOTAL_SCORE, GRADE
+      FROM HACKATHON_APP.RESILIENCE.JEONSE_SAFETY_SCORE
+      ORDER BY NET_MIG DESC
+      LIMIT 10
+
+  - name: "AI 위험 동"
+    question: "AI가 가장 위험하다고 예측한 동 10개"
+    sql: |
+      SELECT s.SGG, s.EMD, s.GRADE, s.JEONSE_RATE, m.ML_RISK_SCORE
+      FROM HACKATHON_APP.RESILIENCE.JEONSE_SAFETY_SCORE s
+      LEFT JOIN HACKATHON_APP.RESILIENCE.ML_RISK_SCORES m
+        ON s.SGG = m.SGG AND s.EMD = m.EMD
+      ORDER BY m.ML_RISK_SCORE DESC NULLS LAST
+      LIMIT 10
+
+  - name: "전세가율 낮은 동"
+    question: "전세가율이 30% 이하인 동 알려줘"
+    sql: |
+      SELECT SGG, EMD, JEONSE_RATE, GRADE, TOTAL_SCORE
+      FROM HACKATHON_APP.RESILIENCE.JEONSE_SAFETY_SCORE
+      WHERE JEONSE_RATE <= 30
+      ORDER BY JEONSE_RATE ASC
+
+  - name: "구별 평균 점수"
+    question: "구별 평균 안전점수가 높은 순서로 보여줘"
+    sql: |
+      SELECT SGG, ROUND(AVG(TOTAL_SCORE), 1) AS AVG_SCORE, COUNT(*) AS AREA_COUNT
+      FROM HACKATHON_APP.RESILIENCE.JEONSE_SAFETY_SCORE
+      GROUP BY SGG
+      ORDER BY AVG_SCORE DESC
