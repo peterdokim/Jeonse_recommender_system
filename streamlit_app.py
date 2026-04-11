@@ -65,6 +65,15 @@ def _profile_card_html(profile: str) -> str:
     )
 
 
+LIKERT_SCALE_LABELS = [
+    "매우 비동의",
+    "비동의",
+    "보통",
+    "동의",
+    "매우 동의",
+]
+
+
 def _ai_loading_card_html(message: str = "AI가 분석하고 있어요...") -> str:
     """Animated 'AI is thinking' placeholder card. Reusable across tabs."""
     return (
@@ -502,6 +511,7 @@ def render_initial_survey() -> None:
         f"</div>",
         unsafe_allow_html=True,
     )
+    st.caption("5점 척도입니다. 왼쪽부터 매우 비동의, 비동의, 보통, 동의, 매우 동의입니다.")
 
     for idx, question in enumerate(SURVEY_QUESTIONS, 1):
         landing_key = f"landing_{question['key']}"
@@ -517,17 +527,17 @@ def render_initial_survey() -> None:
 
         with cols[0]:
             st.markdown(
-                '<p style="font-size:0.72rem;color:#33a474;font-weight:600;'
-                'padding-top:14px;white-space:nowrap">동의</p>',
+                '<p style="font-size:0.9rem;color:#7b4e9e;font-weight:700;'
+                'padding-top:12px;white-space:nowrap">비동의</p>',
                 unsafe_allow_html=True,
             )
 
         for i in range(5):
             val = i + 1
             is_sel = current == val
-            # 선택: 채워진 원(●) + 진한 색, 미선택: 빈 원(○) + 연한 색
+            # 왼쪽은 비동의, 오른쪽은 동의 방향으로 색을 맞춘다.
             if is_sel:
-                label = f":gray[●]" if i == 2 else f":green[●]" if i < 2 else f":violet[●]"
+                label = f":gray[●]" if i == 2 else f":violet[●]" if i < 2 else f":green[●]"
             else:
                 label = f":gray[○]"
 
@@ -535,15 +545,24 @@ def render_initial_survey() -> None:
                 st.button(
                     label,
                     key=f"_cb_{question['key']}_{val}",
-                    use_container_width=True,
+                    width="stretch",
+                    help=f"{val}점: {LIKERT_SCALE_LABELS[i]}",
                     on_click=_on_circle_click,
                     args=(landing_key, val),
+                )
+                st.markdown(
+                    (
+                        '<p style="font-size:0.67rem;color:#666;text-align:center;'
+                        'line-height:1.25;min-height:34px;margin:0.15rem 0 0">'
+                        f'{val}<br>{LIKERT_SCALE_LABELS[i]}</p>'
+                    ),
+                    unsafe_allow_html=True,
                 )
 
         with cols[6]:
             st.markdown(
-                '<p style="font-size:0.72rem;color:#7b4e9e;font-weight:600;'
-                'padding-top:14px;text-align:right;white-space:nowrap">비동의</p>',
+                '<p style="font-size:0.9rem;color:#33a474;font-weight:700;'
+                'padding-top:12px;text-align:right;white-space:nowrap">동의</p>',
                 unsafe_allow_html=True,
             )
 
@@ -551,10 +570,10 @@ def render_initial_survey() -> None:
             st.divider()
 
     st.markdown("")
-    if st.button("다음 단계로", type="primary", use_container_width=True):
+    if st.button("다음 단계로", type="primary", width="stretch"):
         for question in SURVEY_QUESTIONS:
             raw = int(st.session_state.get(f"landing_{question['key']}", 3))
-            st.session_state[question["key"]] = 6 - raw
+            st.session_state[question["key"]] = raw
         st.session_state["survey_completed"] = True
         st.rerun()
 
@@ -807,7 +826,7 @@ if not st.session_state.get("conditions_confirmed"):
         budget_tolerance_pct = st.slider("예산 허용 범위 (±%)", 5, 20, 10, 1, key="setup_budget")
 
     st.markdown("")
-    if st.button("추천 결과 보기", type="primary", use_container_width=True):
+    if st.button("추천 결과 보기", type="primary", width="stretch"):
         st.session_state["deposit_amount"] = from_eok(min(st.session_state["setup_deposit_eok"], _MAX_DEPOSIT_EOK))
         st.session_state["deposit_input_eok"] = st.session_state["setup_deposit_eok"]
         st.session_state["confirmed_sgg"] = st.session_state["setup_sgg"]
@@ -875,7 +894,7 @@ def sidebar_controls():
             search_scope = st.selectbox("탐색 범위", SEARCH_SCOPE_OPTIONS, index=SEARCH_SCOPE_OPTIONS.index(st.session_state.get("confirmed_scope", SEARCH_SCOPE_OPTIONS[1])))
             budget_tolerance_pct = st.slider("예산 허용 범위 (±%)", 5, 20, st.session_state.get("confirmed_budget", 10), 1)
 
-            if st.form_submit_button("조건 적용", type="primary", use_container_width=True):
+            if st.form_submit_button("조건 적용", type="primary", width="stretch"):
                 st.session_state["deposit_amount"] = from_eok(min(deposit_input, _MAX_DEPOSIT_EOK))
                 st.session_state["deposit_input_eok"] = min(deposit_input, _MAX_DEPOSIT_EOK)
                 st.session_state["confirmed_sgg"] = _sgg
@@ -908,7 +927,7 @@ st.sidebar.markdown(
     unsafe_allow_html=True,
 )
 st.sidebar.caption(survey_result["description"])
-if st.sidebar.button(":material/refresh: 성향 다시 측정", use_container_width=True):
+if st.sidebar.button(":material/refresh: 성향 다시 측정", width="stretch"):
     reset_survey()
     st.rerun()
 
@@ -1150,11 +1169,10 @@ market_rankings = load_market_rankings(session)
 if _ai_warm:
     # 캐시 hit — 즉시 응답 (실제로는 ms 단위)
     analysis = get_ai_structured_analysis(session, _ai_cache_key, cortex_prompt)
-    briefing = load_market_briefing(session, survey_result["profile"])
 else:
     # 1차 렌더: 빈 placeholder
     analysis = None
-    briefing = None
+briefing = None
 
 tabs = st.tabs(["개인화 추천", "후보 진단", "비교 분석", "시장 흐름", "AI 질문"])
 
@@ -1230,7 +1248,7 @@ with tabs[0]:
                 alt.Tooltip("JEONSE_RATE:Q", title="전세가율(%)", format=".1f"),
             ],
         )
-        st.altair_chart(chart, use_container_width=True)
+        st.altair_chart(chart, width="stretch")
 
     # 안전등급 가이드
     st.caption(
@@ -1268,7 +1286,7 @@ with tabs[0]:
     recommendation_table["예상 전세가"] = recommendation_table["예상 전세가"].map(format_currency_krw)
     recommendation_table["전세가율"] = recommendation_table["전세가율"].map(lambda v: f"{v:.1f}%")
     recommendation_table["나의 적합도"] = recommendation_table["나의 적합도"].map(lambda v: f"{v:.1f}점")
-    st.dataframe(recommendation_table, use_container_width=True, hide_index=True)
+    st.dataframe(recommendation_table, width="stretch", hide_index=True)
 
     # 제외된 주요 후보와 제외 사유
     excluded_df = recommendation_df[
@@ -1428,7 +1446,7 @@ with tabs[1]:
                             scale=alt.Scale(scheme="greens", domain=[0, 100])),
             tooltip=["항목", alt.Tooltip("점수:Q", format=".0f")],
         ).properties(height=120),
-        use_container_width=True,
+        width="stretch",
     )
 
     # ── 위기 시뮬레이션 ──
@@ -1578,7 +1596,7 @@ with tabs[2]:
                     color=alt.Color("AREA_LABEL:N", title="동네"),
                     tooltip=["AREA_LABEL", "월:N", alt.Tooltip("JEONSE_PRICE:Q", format=",.0f", title="만원")],
                 ),
-                use_container_width=True,
+                width="stretch",
             )
             chart_right.altair_chart(
                 alt.Chart(combined_history).mark_line(point=True).encode(
@@ -1587,7 +1605,7 @@ with tabs[2]:
                     color=alt.Color("AREA_LABEL:N", title="동네"),
                     tooltip=["AREA_LABEL", "월:N", alt.Tooltip("JEONSE_RATIO:Q", format=".1f", title="%")],
                 ),
-                use_container_width=True,
+                width="stretch",
             )
 
         compare_table = compare_rows[
@@ -1610,10 +1628,15 @@ with tabs[2]:
         )
         compare_table["예상 전세가"] = compare_table["예상 전세가"].map(format_currency_krw)
         compare_table["전세가율"] = compare_table["전세가율"].map(lambda v: f"{v:.1f}%")
-        st.dataframe(compare_table, use_container_width=True, hide_index=True)
+        st.dataframe(compare_table, width="stretch", hide_index=True)
 
 with tabs[3]:
     st.subheader("시장 흐름")
+
+    if "_market_briefing_cache" not in st.session_state:
+        st.session_state["_market_briefing_cache"] = {}
+    briefing_cache = dict(st.session_state.get("_market_briefing_cache", {}))
+    briefing = briefing_cache.get(survey_result["profile"])
 
     def _fmt_pyeong_price(val):
         """평당가(만원 단위)를 자연스럽게 표시."""
@@ -1635,16 +1658,22 @@ with tabs[3]:
         unsafe_allow_html=True,
     )
 
-    # `briefing`은 lazy 로딩 — 1차 렌더 시점엔 None일 수 있음
+    briefing_col, briefing_meta = st.columns([1, 3])
+    with briefing_col:
+        if st.button(
+            "서울 시장 AI 브리핑 보기" if briefing is None else "서울 시장 AI 브리핑 새로고침",
+            key="market_briefing_button",
+            width="stretch",
+        ):
+            with st.spinner("서울 시장 AI 브리핑을 생성하고 있습니다..."):
+                briefing_cache[survey_result["profile"]] = load_market_briefing(session, survey_result["profile"])
+            st.session_state["_market_briefing_cache"] = briefing_cache
+            st.rerun()
+  
+
     import html as _html
     if briefing is None:
-        # 1차 렌더 — 브리핑 로딩 중. 카드 자리에 로딩 placeholder만 표시
-        st.markdown(
-            _ai_loading_card_html(
-                "AI가 서울 288개 동의 시장 흐름을 분석하고 있습니다. 잠시만 기다려 주세요."
-            ),
-            unsafe_allow_html=True,
-        )
+        st.info("버튼을 누르면 서울 전체 시장 AI 브리핑을 불러옵니다.")
         st.markdown('<div style="height:0.6rem"></div>', unsafe_allow_html=True)
 
     headline = (briefing or {}).get("headline", "") or ""
@@ -1877,7 +1906,7 @@ with tabs[3]:
             f'{selected_area} 매매가·전세가 추이</div>',
             unsafe_allow_html=True,
         )
-        st.altair_chart(make_history_chart(selected_history_df), use_container_width=True)
+        st.altair_chart(make_history_chart(selected_history_df), width="stretch")
 
     # ── 최근 실거래 내역 ──
     st.markdown('<div style="height:1.6rem"></div>', unsafe_allow_html=True)
@@ -1900,7 +1929,7 @@ with tabs[3]:
 
         raw_tx["거래가(만원)"] = raw_tx["거래가(만원)"].apply(lambda v: f"{v:,.0f}" if pd.notna(v) else "-")
         raw_tx["평당가(만원)"] = raw_tx["평당가(만원)"].apply(lambda v: f"{v:,.0f}" if pd.notna(v) else "-")
-        st.dataframe(raw_tx, use_container_width=True, hide_index=True, height=320)
+        st.dataframe(raw_tx, width="stretch", hide_index=True, height=320)
         st.caption(f"총 {len(raw_tx)}건 · 매매=매매가, 전세=보증금 (단위: 만원)")
 
     # ── 단지별 비교 ──
@@ -1923,12 +1952,14 @@ with tabs[3]:
         for col in ["매매중위(만원)", "매매평당(만원)", "전세중위(만원)", "전세평당(만원)"]:
             if col in complex_df.columns:
                 complex_df[col] = complex_df[col].apply(lambda v: f"{v:,.0f}" if pd.notna(v) else "-")
+        for col in ["매매건수", "전세건수"]:
+            if col in complex_df.columns:
+                complex_df[col] = complex_df[col].apply(lambda v: f"{int(v):,}" if pd.notna(v) else "-")
         if "전세가율(%)" in complex_df.columns:
             complex_df["전세가율(%)"] = complex_df["전세가율(%)"].apply(lambda v: f"{v:.1f}" if pd.notna(v) else "-")
         if "주요면적(m²)" in complex_df.columns:
             complex_df["주요면적(m²)"] = complex_df["주요면적(m²)"].apply(lambda v: f"{v:.0f}" if pd.notna(v) else "-")
-        complex_df = complex_df.fillna("-")
-        st.dataframe(complex_df, use_container_width=True, hide_index=True)
+        st.dataframe(complex_df, width="stretch", hide_index=True)
         st.caption(f"총 {len(complex_df)}개 단지")
 
 with tabs[4]:
@@ -1968,7 +1999,7 @@ with tabs[4]:
                 if st.button(
                     f"{icon}\n\n**{title}**",
                     key=f"_analyst_q_{title}",
-                    use_container_width=True,
+                    width="stretch",
                 ):
                     st.session_state["_analyst_question"] = q
 
@@ -2037,7 +2068,7 @@ with tabs[4]:
                     f'</div>',
                     unsafe_allow_html=True,
                 )
-                st.dataframe(df_display, use_container_width=True, hide_index=True)
+                st.dataframe(df_display, width="stretch", hide_index=True)
             else:
                 st.info("결과가 없습니다.")
     else:
@@ -2046,15 +2077,13 @@ with tabs[4]:
 # ──────────────────────────────────────────────────────────────────────
 # 2-pass lazy AI 로딩의 2단계
 # 모든 탭이 1차 렌더되어 사용자가 추천 결과를 볼 수 있는 상태에서,
-# 백그라운드로 두 AI 호출을 병렬 실행하고 완료되면 st.rerun()으로 새로고침.
-# 두 번째 렌더는 캐시 hit이라 즉시 응답.
+# 후보 진단 AI만 백그라운드로 미리 호출하고 완료되면 st.rerun()으로 새로고침.
+# 시장 브리핑은 시장 흐름 탭에서 버튼을 눌렀을 때만 실행한다.
 # ──────────────────────────────────────────────────────────────────────
 if not _ai_warm:
-    with ThreadPoolExecutor(max_workers=2) as _ai_pool:
+    with ThreadPoolExecutor(max_workers=1) as _ai_pool:
         _f_a = _ai_pool.submit(get_ai_structured_analysis, session, _ai_cache_key, cortex_prompt)
-        _f_b = _ai_pool.submit(load_market_briefing, session, survey_result["profile"])
         _f_a.result()
-        _f_b.result()
     st.session_state["_ai_warm_key"] = _ai_cache_key
     st.rerun()
 
