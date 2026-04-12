@@ -1,0 +1,466 @@
+===== SLIDE 1 =====
+전세 안심 추천 시스템
+AI 기반 Snowflake
+쉬었음 청년들
+김도헌 조현승
+Apr 2026
+© 2026 Snowflake Inc. All Rights Reserved
+--- NOTES ---
+‹#›
+
+===== SLIDE 2 =====
+팀 소개
+쉬었음 청년들
+김도헌
+조현승
+© 2026 Snowflake Inc. All Rights Reserved
+--- NOTES ---
+‹#›
+
+===== SLIDE 3 =====
+겉으로 보이는 문제
+전세 시세 정보는 많지만...
+"이 집이 안전한지"는 스스로 판단해야 합니다
+안전한 전세를 판단하려면...
+필요한 데이터가 여러 곳에 흩어져 있어 한눈에 보기 어렵습니다
+진짜 풀어야 할 문제
+01
+위험 진단이 아니라,
+더 나은 선택지
+가 필요하다
+"위험합니다"만으론 행동이 바뀌지 않는다
+내 예산·생활권 안에서 더 안전한 대안 비교가 가능해야 한다
+기존 서비스는 검색·진단까지만 — 대안 비교는 없다
+02
+숫자만으론
+결심할 수 없다
+"전세가율 78%, 등급 B" — 의미가 와닿지 않는다
+전 재산의 절반인 보증금, 이해할 수 있는 언어가 아니다
+쉬운 해석 + 구체적 행동 가이드가 필요하다
+03
+사람마다 상황이 다른데,
+답은 하나다
+신혼부부·1인가구·은퇴자의 위험 감수 범위가 다르다
+누구에게나 같은 등급, 같은 순위를 보여준다
+개인 상황에 맞는 맞춤형 대안이 필요하다
+© 2026 Snowflake Inc. All Rights Reserved
+--- NOTES ---
+‹#›
+
+===== SLIDE 4 =====
+솔루션 소개
+"
+사용자의 보증금·생활권·성향을 입력받아,
+더 안전한 전세 대안
+을 개인별로 추천하는 AI 의사결정 도구
+"
+01
+성향별 다른 추천
+6문항 설문으로 보수형 · 중도위험형 · 모험형 분류
+02
+3축 복합 안전 + ML 예측
+단일 지표가 아닌 종합 판단 — ML 미래 예측 + 휴리스틱 백테스트
+03
+Cortex LLM 자연어 진단
+숫자를 사람의 언어로 — 쉬운 해석과 행동 가이드 제공
+개인화 추천
+후보 진단
+비교 분석
+시장 흐름
+AI 질문
+© 2026 Snowflake Inc. All Rights Reserved
+--- NOTES ---
+‹#›
+
+===== SLIDE 5 =====
+활용 데이터
+Snowflake Marketplace 2종 + 외부 공공데이터 3종
+MARKETPLACE
+RICHGO
+Korea_Real_Estate_Apartment_Market_Intelligence.HACKATHON_2026
+테이블
+역할
+REGION_APT_RICHGO_MARKET_PRICE_M_H
+동별 매매·전세 평당가 → 전세가율, 변동률
+APT_DANJI_AND_TRANSPORTATION_TRAIN_DISTANCE
+단지별 지하철역 거리 → S_SUB
+REGION_POPULATION_MOVEMENT
+구별 순이동 인구 → S_MIG
+SPH — GRANDATA
+SEOUL_DISTRICTLEVEL_DATA_...GRANDATA
+테이블
+역할
+FLOATING_POPULATION_INFO
+주거·근무·방문 인구 → LIFESTYLE_FIT
+ASSET_INCOME_INFO
+신용점수·소득 → INCOME_SCORE
+M_SCCO_MST
+자치구 코드 매핑 (조인 키)
+공공데이터
+국토교통부
+데이터
+역할
+아파트 매매 실거래가
+data.go.kr/15126468
+실거래 검증, 평형대 정밀가
+아파트 전월세 실거래가
+data.go.kr/15126474
+전세 중위가, 거래 활발도
+HUG 전세보증보험
+데이터
+역할
+전세보증금 반환보증 사고 현황
+data.go.kr/15134038
+HUG_RATE → 구별 사고율
+※ NEXTRADE · 아정당은 본 프로젝트 범위에서 미사용
+규모
+서울 25개 구 · 288개 동 · 5종 데이터 통합
+적재 방식
+Marketplace → Grant 직접 JOIN
+|
+외부 → SHA256 MERGE 멱등 적재
+© 2026 Snowflake Inc. All Rights Reserved
+--- NOTES ---
+‹#›
+
+===== SLIDE 6 =====
+가설 1: 개인화 추천
+같은 예산이어도, 최적의 집은 사람마다 다르다
+· 보증금 5억의 신혼부부와 은퇴자는 위험 감내도가 다르다
+· 성향을 수치화하지 않으면 추천이 일률적일 수밖에 없다
+6문항 설문 → 3축 독립 채점
+Q1~Q3 안전 지향 →
+safety_preference
+Q4 편의 지향 →
+convenience_preference
+Q5~Q6 유사성 지향 →
+similarity_preference
+risk_tolerance = (100−safety)×0.5 + convenience×0.25 + similarity×0.25
+3가지 위험 프로파일
+프로파일
+기준
+α
+β
+γ
+δ
+보수형
+< 35
+1.4
+1.2
+0.8
+0.7
+중도위험형
+35~64
+1.0
+1.0
+1.0
+1.0
+모험형
+≥ 65
+0.7
+0.8
+1.2
+1.2
+α/β/γ/δ 합이 1.0이 되도록 가중치 정규화
+SPH 유동인구 → 생활권 점수
+LIFESTYLE_FIT = 0.35×방문 + 0.20×근무 + 0.15×소득 + 0.10×주거 + 0.10×이주 + 0.10×지하철
+COMMUTE_FIT: 직장 구 일치 시 +30점, WORK_POP 5% 가중
+© 2026 Snowflake Inc. All Rights Reserved
+--- NOTES ---
+‹#›
+
+===== SLIDE 7 =====
+가설 1: 개인화 추천 (2/2)
+성향이 다르면, 추천도 달라진다
+6문항 설문
+▼
+Q1~Q3 안전 지향 → safety
+Q4 편의 지향 → convenience
+Q5~Q6 유사성 지향 → similarity
+→ 3개 점수
+독립 계산
+▼
+risk_tolerance 산출
+< 35 → 보수형
+< 65 → 중도위험형
+≥ 65 → 모험형
+▼
+보수형
+α1.4 β1.2
+γ0.8 δ0.7
+중도위험형
+α1.0 β1.0
+γ1.0 δ1.0
+모험형
+α0.7 β0.8
+γ1.2 δ1.2
+▼
+3-type 추천 카드
+가장 안전 · 균형 · 가장 비슷
+앱 적용 기능
+기능
+구현 방식
+6문항 설문
+classify_survey_profile()로 3축 독립 채점
+사이드바 조건 입력
+@st.fragment 캐스케이딩 구→동
+평형대 4버킷 정밀가
+SMALL·MID·LARGE·XLARGE 중위가
+3-type 후보 출력
+가장 안전 / 균형 / 가장 비슷
+SPH 유동인구
+LIFESTYLE · COMMUTE_FIT_SCORE
+프로파일에 따라 α/β/γ/δ가 달라지므로, 보수형과 모험형의 가중치 분포가 다르고 3-type 카드의 후보가 달라진다.
+© 2026 Snowflake Inc. All Rights Reserved
+--- NOTES ---
+‹#›
+
+===== SLIDE 8 =====
+가설 2: 복합 안전 + ML
+단일 지표로는 안전을 잴 수 없다 — 3축 복합 + ML 예측 + 백테스트 삼중 검증
+① 3축 복합 안전 점수
+S_RATE (50%) ← 전세가율 백분위
+S_MIG (25%) ← 거래량 백분위
+S_SUB (25%) ← 변동성 백분위
+A(≥80) / B(≥60) / C(≥40) / D
+▼
+RULE_SCORE
+0.6×안전 + α/β/γ/δ × 보조점수
+α:손실회피 β:가격적정 γ:선호적합 δ:유사도 (합 1.0)
+▼
+RECOMMENDATION_SCORE
+= RULE_SCORE × 0.80 + ML_SAFETY × 0.20
+▲
+② GradientBoosting ML
+8개 피처 · ROC AUC ≈ 0.74
+ML_SAFETY = 100 − ML_RISK_SCORE
+· 전세가율 70%여도 거래 5건 미만이면 유동성 위험
+· 과거 안정성은 규칙, 미래 변동성은 ML, 회복력은 백테스트
+· 룰과 ML을 블렌딩하고 백테스트로 추가 필터링
+③ 휴리스틱 백테스트
+롤링 12개월 윈도우 가격 시계열 분석
+BT_WORST_DRAWDOWN_PCT
+최악 낙폭 (35%)
+BT_RECOVERY_RATE
+12개월 후 회복 비율 (25%)
+BT_DOWNSIDE_HIT_RATE
+−10%+ 하락 빈도 (15%)
+BACKTEST_SCORE
+0.35×worst + 0.25×median + 0.25×recovery + 0.15×(100−hit)
+④ Hard Filter 4중 적용
+· 예산: 보증금 + 허용범위% 이하
+· 지역 범위: 관심 구 / 출퇴근권 / 전체
+· 거래량: 최근 6개월 5건 미만 제외
+(HAS_ENOUGH_TX)
+· 절대 위험: 전세가율 90% 이상 절대 제외
+(NOT_ABSOLUTE_RISK)
+ML 피처: JEONSE_RATE, SALE_CUSHION_PCT, RATE_VOLATILITY, JEONSE_CHANGE_12M_PCT, RECENT_TX_COUNT, TRADE_COUNT, RENT_COUNT, TRADE_RATIO_PCT
+타겟: LEAD(JEONSE_PRICE,6)로 6개월 후 5%+ 하락 라벨 · n_estimators=200 max_depth=4 lr=0.05 · 80/20 stratified
+© 2026 Snowflake Inc. All Rights Reserved
+--- NOTES ---
+‹#›
+
+===== SLIDE 9 =====
+가설 2: 복합 안전 + ML (2/2)
+앱에서 어떻게 동작하는가
+기능
+구현 방식
+A/B/C/D 안전 등급
+3축 점수 기반, 거래 10건 미만 변동성 50 대체
+Hard Filter 4종
+예산·범위·거래·절대위험 다중 컷오프
+11가지 제외 사유
+build_exclusion_reasons()
+이모지 표시
+HUG 사고율
+구별 보증사고율 LEFT JOIN 문맥 지표
+Snowpark ML Registry
+GradientBoosting ROC AUC 0.74
+휴리스틱 백테스트
+4개 지표 + BACKTEST_SCORE
+비교 분석 (탭3)
+현재 vs 추천 나란히 비교
+시장 흐름 (탭4)
+TOP 5 랭킹 + 시세 차트 + 실거래
+검증 결과
+• 서울 288개 동에 3축 점수 + 백분위 등급화 적용
+• ML 모델 ROC AUC ≈ 0.74
+• 백테스트 모든 동 4개 지표 산출 → 추가 시그널 활용
+추천 카드
+후보 비교 분석
+제외 사유 표시
+시장 흐름 — 위험 · 안전 · 거래활발 TOP 5
+최근 실거래 내역
+© 2026 Snowflake Inc. All Rights Reserved
+--- NOTES ---
+‹#›
+
+===== SLIDE 10 =====
+가설 3: 자연어 AI
+숫자에 LLM 한 단락을 더하면, 사용자 의사결정이 가능해진다
+· '전세가율 78%, 등급 B'는 일반 사용자에게 와닿지 않는다
+· 왜 안전한지, 주의점, 다음 행동 — 자연어로 풀어줘야 결정으로 이어진다
+① Cortex COMPLETE
+후보 동별 강점/주의점/추천 행동을 JSON 생성
+폴백 체인: claude-3-5-sonnet → llama3.1-70b → mistral-large2
+② Cortex AI_AGG
+위험/안전/거래활발 TOP 3을 단일 SQL에서 LLM 집계 → JSON 시장 브리핑
+출력: headline, market_mood, watch_areas[], opportunity_areas[], user_action
+사용자 프로파일을 프롬프트에 주입해 톤·관점 차별화
+③ Cortex Analyst
+REST API + 시맨틱 모델 (jeonse_model.yaml)
+자연어 → SQL 변환
+Snowflake Cortex AI
+COMPLETE
+후보 동별
+강점/주의/행동 JSON
+폴백 체인:
+claude-3-5-sonnet
+→ llama3.1-70b
+→ mistral-large2
+AI_AGG
+시장 전체 브리핑
+단일 SQL 집계
+JSON 출력:
+headline, market_mood,
+watch_areas[],
+user_action
+Cortex Analyst
+자연어 질문 →
+SQL 변환
+시맨틱 모델:
+jeonse_model.yaml
+REST API
+▼
+[탭2] 후보 진단
+▼
+[탭4] 시장 흐름
+▼
+[탭5] AI 질문
+SELECT AI_AGG(LINE, '<JSON 출력 프롬프트>') AS RESULT FROM combined
+© 2026 Snowflake Inc. All Rights Reserved
+--- NOTES ---
+‹#›
+
+===== SLIDE 11 =====
+가설 3: 자연어 AI (2/2)
+앱에서 어떻게 동작하는가
+기능
+구현 방식
+탭2 후보 진단
+COMPLETE로 강점·주의점·행동 JSON + 폴백 체인
+탭4 AI 시장 브리핑 ⭐
+AI_AGG 단일 SQL → LLM 집계, JSON 출력 강제
+탭5 AI 질문
+Cortex Analyst REST API + jeonse_model.yaml
+2-pass Lazy Loading
+1차 SQL 즉시 → 2차 AI 응답 (ThreadPoolExecutor)
+2-pass 렌더링 흐름
+1차 렌더
+SQL 결과 즉시 표시 + 로딩 카드
+→
+2차 렌더
+AI 응답 채워짐 (st.rerun)
+검증 결과
+• Cortex 3종(COMPLETE · AI_AGG · Analyst)이 5개 탭에 모두 통합
+• AI_AGG는 단일 SQL로 LLM 집계 — 앱 레이어 프롬프트 어셈블 없음
+• 2-pass + ThreadPoolExecutor로 첫 렌더 SQL 즉시, AI는 백그라운드
+탭2 — AI 진단 (강점 · 주의 · 행동)
+탭4 — AI 시장 브리핑 ⭐
+탭5 — Cortex Analyst 질문 결과
+© 2026 Snowflake Inc. All Rights Reserved
+--- NOTES ---
+‹#›
+
+===== SLIDE 12 =====
+전체 아키텍처
+모든 것이 Snowflake 안에서 — End-to-End Vertical Stack
+8단 SQL 파이프라인
+8피처 · AUC 0.74
+Cortex 3종
+2-pass Lazy
+RICHGO
+가격·이동·지하철
+Marketplace
+직접 JOIN
+SPH
+인구·자산
+GRANDATA
+직접 JOIN
+국토교통부
+실거래가
+공공API
+SHA256 MERGE
+HUG
+전세사고
+공공데이터
+직접 INSERT
+LAWD코드
+매핑
+자체구축
+직접 INSERT
+▼
+❄ SNOWFLAKE — HACKATHON_APP.RESILIENCE
+[1] RAW 적재
+→
+[2] CLEAN → MONTHLY
+→
+[3] RESILIENCE_BASE
+→
+[4] FEATURE_AREA_MONTH
+[5] SAFETY_SCORE (A/B/C/D)
+→
+[6] ML_TRAIN_FEATURES
+→
+[7] ML_RISK_SCORES (AUC 0.74)
+[8] Cortex AI:
+COMPLETE → 탭2
+AI_AGG ⭐ → 탭4
+Analyst → 탭5
+▼
+Streamlit App (5개 탭)
+개인화 추천 · 후보 진단 · 비교 · 시장 흐름 · AI 질문
+→ Snowflake Native App (snow app run)
+데이터 적재 · 피처 엔지니어링 · 점수 산출 · ML 학습/추론 · LLM 호출 —
+전부 Snowflake 안에서
+. 데이터 반출 ZERO.
+© 2026 Snowflake Inc. All Rights Reserved
+--- NOTES ---
+‹#›
+
+===== SLIDE 13 =====
+느낀점 / 회고
+프로젝트를 통해 배운 것
+기술적으로 배운 점
+Snowflake 하나로 정말 다 됐다.
+ETL부터 ML 학습/추론, LLM 호출까지 한 곳에서 끝나는 게 처음이라 신기했다.
+AI_AGG가 인상적이었다.
+SQL 한 줄 안에서 LLM을 집계 함수처럼 쓰는 건 처음 봤는데, 데이터베이스가 자연어 인사이트를 바로 뱉어내는 게 신선했다.
+Snowpark ML Registry는 실용적이었다.
+모델을 등록하고 Snowflake 안에서 바로 추론까지 돌릴 수 있어서 데이터를 밖으로 빼낼 필요가 없었다.
+문제 정의에서 배운 점
+뭘 만들지 정하는 게 제일 어려웠다.
+처음엔 '전세가 안전한지 알려주는 앱'을 만들려고 했는데, 사용자가 진짜 궁금한 건 '그래서 다른 어디가 더 나은데?'였다. 중간에 방향을 틀어서 진단이 아니라 추천으로 다시 설계했다.
+숫자보다 말이 더 잘 통한다.
+'전세가율 78%, 등급 B' 같은 숫자보다 LLM이 한 문장으로 풀어 써 준 설명이 훨씬 와닿았다.
+처음 짠 추천 로직은 잘 안 됐다.
+설문 점수를 단순히 합산했더니 어떤 답을 해도 결과가 비슷했다. 안전을 중시하는 답과 위험을 감수하는 답을 따로 채점해서 반영하니 그제야 사용자마다 다른 결과가 나왔다.
+팀워크·협업에서 배운 점
+역할을 빨리 나눈 게 좋았다.
+데이터, 추천 엔진, AI, UI를 각자 맡아서 동시에 진행하고 매일 짧게 공유했다.
+남이 짠 코드 위에서 일하는 법을 배웠다.
+처음엔 코드 스타일이 달라서 충돌이 잦았는데, 공통 모듈을 분리하고 함수 형태를 미리 맞추니 점점 매끄러워졌다.
+공공 데이터는 생각보다 깔끔하지 않았다.
+국토부 API 정합성, HUG 단위 차이, Marketplace 커버리지 제약을 같이 부딪혀 보면서 완벽한 데이터는 없다는 걸 알게 됐다.
+데이터를 모으는 것보다, 데이터로 사람을 설득하는 게 훨씬 어렵다. 그리고 그 사이에
+Snowflake와 Cortex
+가 있었다.
+© 2026 Snowflake Inc. All Rights Reserved
+--- NOTES ---
+‹#›
+
+===== SLIDE 14 =====
+감사합니다
+© 2026 Snowflake Inc. All Rights Reserved
+--- NOTES ---
+‹#›
