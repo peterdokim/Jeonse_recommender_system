@@ -1265,6 +1265,8 @@ with tabs[0]:
             "RECOMMENDATION_SCORE",
             "JEONSE_RATE",
             "ESTIMATED_TOTAL_JEONSE",
+            "RICHGO_TOTAL_SCORE",
+            "RICHGO_GRADE",
         ]
     ].copy()
     recommendation_table["RECOMMENDATION_RANK"] = recommendation_table["RECOMMENDATION_RANK"].apply(
@@ -1281,12 +1283,21 @@ with tabs[0]:
             "RECOMMENDATION_SCORE": "나의 적합도",
             "JEONSE_RATE": "전세가율",
             "ESTIMATED_TOTAL_JEONSE": "예상 전세가",
+            "RICHGO_TOTAL_SCORE": "리치고 점수",
+            "RICHGO_GRADE": "리치고 등급",
         }
     )
     recommendation_table["예상 전세가"] = recommendation_table["예상 전세가"].map(format_currency_krw)
     recommendation_table["전세가율"] = recommendation_table["전세가율"].map(lambda v: f"{v:.1f}%")
     recommendation_table["나의 적합도"] = recommendation_table["나의 적합도"].map(lambda v: f"{v:.1f}점")
+    recommendation_table["리치고 점수"] = recommendation_table["리치고 점수"].apply(
+        lambda v: f"{float(v):.1f}점" if pd.notna(v) else "-"
+    )
+    recommendation_table["리치고 등급"] = recommendation_table["리치고 등급"].apply(
+        lambda v: str(v) if pd.notna(v) and str(v).strip() else "-"
+    )
     st.dataframe(recommendation_table, width="stretch", hide_index=True)
+    st.caption("리치고 점수와 등급은 현재 비교용 보조 지표이며, 아직 최종 추천 점수에는 직접 반영되지 않습니다.")
 
     # 제외된 주요 후보와 제외 사유
     excluded_df = recommendation_df[
@@ -1343,6 +1354,31 @@ with tabs[1]:
         f"{candidate_row.get('ML_RISK_SCORE', 50):.0f}%",
         help="AI가 예측한 6개월 내 전세가 5%+ 하락 확률",
     )
+
+    if bool(candidate_row.get("HAS_RICHGO_SIGNAL", False)):
+        richgo_score = candidate_row.get("RICHGO_TOTAL_SCORE")
+        richgo_grade = candidate_row.get("RICHGO_GRADE")
+        richgo_jeonse_rate = candidate_row.get("RICHGO_JEONSE_RATE")
+
+        rg_1, rg_2, rg_3 = st.columns(3)
+        rg_1.metric(
+            "리치고 구조 점수",
+            f"{float(richgo_score):.1f}" if pd.notna(richgo_score) else "-",
+            help="리치고 구조 신호 기준 보조 점수",
+        )
+        rg_2.metric(
+            "리치고 등급",
+            f"{richgo_grade}" if pd.notna(richgo_grade) else "-",
+            help="리치고 구조 신호 기준 보조 등급",
+        )
+        rg_3.metric(
+            "리치고 전세가율",
+            f"{float(richgo_jeonse_rate):.1f}%" if pd.notna(richgo_jeonse_rate) else "-",
+            help="리치고 가격 데이터 기준 전세가율",
+        )
+        st.caption("리치고 구조 신호는 현재 진단 보조 지표로만 표시되며, 아직 최종 추천 점수에는 직접 반영되지 않습니다.")
+    else:
+        st.caption("리치고 구조 신호가 연결되지 않은 지역입니다. 현재는 국토부 실거래 기반 진단만 표시합니다.")
 
     # ── AI 분석 (전체 너비, 총평이 메인) ──
     # 분석은 탭 렌더 전에 미리 호출되어 `analysis` 변수에 저장됨

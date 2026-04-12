@@ -5,6 +5,7 @@ import streamlit as st
 from snowflake.snowpark import Session
 
 SCORE_TABLE = "HACKATHON_APP.RESILIENCE.JEONSE_SAFETY_SCORE"
+ENRICHED_SCORE_TABLE = "HACKATHON_APP.RESILIENCE.JEONSE_SCORE_ENRICHED"
 BASE_VIEW = "HACKATHON_APP.RESILIENCE.RESILIENCE_BASE"
 
 
@@ -53,7 +54,7 @@ def load_latest_market_snapshot(_session: Session) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def load_scores(_session: Session) -> pd.DataFrame:
-    query = f"""
+    enriched_query = f"""
         WITH latest_snapshot AS (
             SELECT
                 SGG,
@@ -93,6 +94,78 @@ def load_scores(_session: Session) -> pd.DataFrame:
             b.RES_POP,
             b.WORK_POP,
             b.VISIT_POP,
+            COALESCE(s.RICHGO_JEONSE_RATE, NULL) AS RICHGO_JEONSE_RATE,
+            COALESCE(s.RICHGO_JEONSE_DROP_PCT, NULL) AS RICHGO_JEONSE_DROP_PCT,
+            COALESCE(s.RICHGO_NET_MIG, NULL) AS RICHGO_NET_MIG,
+            COALESCE(s.RICHGO_SUBWAY_DIST, NULL) AS RICHGO_SUBWAY_DIST,
+            COALESCE(s.RICHGO_S_RATE, NULL) AS RICHGO_S_RATE,
+            COALESCE(s.RICHGO_S_MIG, NULL) AS RICHGO_S_MIG,
+            COALESCE(s.RICHGO_S_SUB, NULL) AS RICHGO_S_SUB,
+            COALESCE(s.RICHGO_TOTAL_SCORE, NULL) AS RICHGO_TOTAL_SCORE,
+            COALESCE(s.RICHGO_GRADE, NULL) AS RICHGO_GRADE,
+            COALESCE(s.HAS_RICHGO_SIGNAL, FALSE) AS HAS_RICHGO_SIGNAL,
+            COALESCE(ml.ML_RISK_SCORE, 50.0) AS ML_RISK_SCORE,
+            COALESCE(ml.ML_DROP_PROB, 0.5) AS ML_DROP_PROB
+        FROM {ENRICHED_SCORE_TABLE} s
+        LEFT JOIN latest_snapshot b
+            ON s.SGG = b.SGG
+           AND s.EMD = b.EMD
+           AND b.RN = 1
+        LEFT JOIN HACKATHON_APP.RESILIENCE.ML_RISK_SCORES ml
+            ON s.SGG = ml.SGG
+           AND s.EMD = ml.EMD
+        ORDER BY s.TOTAL_SCORE DESC, s.SGG, s.EMD
+    """
+    fallback_query = f"""
+        WITH latest_snapshot AS (
+            SELECT
+                SGG,
+                EMD,
+                AVG_ASSET,
+                AVG_INCOME,
+                AVG_CREDIT_SCORE,
+                AVG_LOAN,
+                RES_POP,
+                WORK_POP,
+                VISIT_POP,
+                ROW_NUMBER() OVER (
+                    PARTITION BY SGG, EMD
+                    ORDER BY YYYYMMDD DESC
+                ) AS RN
+            FROM {BASE_VIEW}
+        )
+        SELECT
+            s.SGG,
+            s.EMD,
+            s.MEME_LATEST,
+            s.JEONSE_LATEST,
+            s.JEONSE_RATE,
+            s.JEONSE_DROP_PCT,
+            s.HUG_RATE,
+            s.NET_MIG,
+            s.SUBWAY_DIST,
+            s.S_RATE,
+            s.S_MIG,
+            s.S_SUB,
+            s.TOTAL_SCORE,
+            s.GRADE,
+            b.AVG_ASSET,
+            b.AVG_INCOME,
+            b.AVG_CREDIT_SCORE,
+            b.AVG_LOAN,
+            b.RES_POP,
+            b.WORK_POP,
+            b.VISIT_POP,
+            CAST(NULL AS FLOAT) AS RICHGO_JEONSE_RATE,
+            CAST(NULL AS FLOAT) AS RICHGO_JEONSE_DROP_PCT,
+            CAST(NULL AS FLOAT) AS RICHGO_NET_MIG,
+            CAST(NULL AS FLOAT) AS RICHGO_SUBWAY_DIST,
+            CAST(NULL AS FLOAT) AS RICHGO_S_RATE,
+            CAST(NULL AS FLOAT) AS RICHGO_S_MIG,
+            CAST(NULL AS FLOAT) AS RICHGO_S_SUB,
+            CAST(NULL AS FLOAT) AS RICHGO_TOTAL_SCORE,
+            CAST(NULL AS VARCHAR) AS RICHGO_GRADE,
+            FALSE AS HAS_RICHGO_SIGNAL,
             COALESCE(ml.ML_RISK_SCORE, 50.0) AS ML_RISK_SCORE,
             COALESCE(ml.ML_DROP_PROB, 0.5) AS ML_DROP_PROB
         FROM {SCORE_TABLE} s
@@ -105,7 +178,10 @@ def load_scores(_session: Session) -> pd.DataFrame:
            AND s.EMD = ml.EMD
         ORDER BY s.TOTAL_SCORE DESC, s.SGG, s.EMD
     """
-    return _session.sql(query).to_pandas()
+    try:
+        return _session.sql(enriched_query).to_pandas()
+    except Exception:
+        return _session.sql(fallback_query).to_pandas()
 
 
 @st.cache_data(show_spinner=False)

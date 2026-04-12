@@ -651,6 +651,10 @@ CREATE TABLE IF NOT EXISTS HACKATHON_APP.RESILIENCE.ML_RISK_SCORES (
 -- Quick checks
 -- ============================================================
 
+-- Optional Richgo/Marketplace enrichment:
+-- Run setup_richgo_overlay.sql after this file if you want to restore
+-- Richgo-based structural signals in parallel with the public MOLIT pipeline.
+
 SELECT COUNT(*) AS TRADE_ROWS
 FROM HACKATHON_APP.RESILIENCE.RAW_MOLIT_APT_TRADE;
 
