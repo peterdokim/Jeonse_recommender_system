@@ -109,6 +109,31 @@ def clamp_score(value: float) -> float:
     return max(0.0, min(100.0, value))
 
 
+def compute_scope_fit_score(
+    area_sgg: pd.Series,
+    candidate_sgg: str,
+    workplace_sgg: str,
+    search_scope: str,
+) -> pd.Series:
+    """탐색 범위 우선순위와의 정합도를 0~100 점수로 환산한다."""
+    same_candidate_sgg = area_sgg.astype(str) == str(candidate_sgg)
+    same_workplace_sgg = area_sgg.astype(str) == str(workplace_sgg)
+
+    if search_scope == "현재 관심 구 우선":
+        scope_score = pd.Series(20.0, index=area_sgg.index, dtype="float64")
+        scope_score.loc[same_workplace_sgg] = 45.0
+        scope_score.loc[same_candidate_sgg] = 100.0
+    elif search_scope == "출퇴근권 우선":
+        scope_score = pd.Series(20.0, index=area_sgg.index, dtype="float64")
+        scope_score.loc[same_candidate_sgg] = 60.0
+        scope_score.loc[same_workplace_sgg] = 100.0
+    else:
+        scope_score = pd.Series(70.0, index=area_sgg.index, dtype="float64")
+        scope_score.loc[same_candidate_sgg | same_workplace_sgg] = 88.0
+
+    return scope_score.round(1)
+
+
 def to_eok(value: float) -> float:
     return value / 100_000_000
 
@@ -575,6 +600,12 @@ def build_recommendation_dataset(
     candidate_sgg = str(candidate_row["SGG"])
     candidate_jeonse = float(candidate_row["ESTIMATED_TOTAL_JEONSE"])
     candidate_rate = float(candidate_row["JEONSE_RATE"])
+    df["SCOPE_FIT_SCORE"] = compute_scope_fit_score(
+        area_sgg=df["SGG"],
+        candidate_sgg=candidate_sgg,
+        workplace_sgg=workplace_sgg,
+        search_scope=search_scope,
+    )
 
     price_similarity = (
         100 - (df["ESTIMATED_TOTAL_JEONSE"] - candidate_jeonse).abs() / max(candidate_jeonse, 1) * 120
@@ -608,14 +639,27 @@ def build_recommendation_dataset(
 
     convenience_weight = 0.35 + float(survey_result["convenience_preference"]) / 100 * 0.30
     lifestyle_weight = 1 - convenience_weight
+    # 탐색 범위를 바꾸면 점수 차이가 눈에 띄게 나도록, 범위 우선순위의 비중과 보정폭을 크게 준다.
+    if search_scope in {"현재 관심 구 우선", "출퇴근권 우선"}:
+        scope_weight = 0.78
+        scope_adjust_baseline = 50.0
+        scope_adjust_scale = 0.18
+    else:
+        scope_weight = 0.35
+        scope_adjust_baseline = 70.0
+        scope_adjust_scale = 0.06
 
     df["SAFETY_SCORE"] = df["MARKET_SCORE"]
     df["LOSS_PENALTY_SCORE"] = (100 - df["LOSS_EXPOSURE_SCORE"]).clip(0, 100).round(1)
     df["PRICE_OVERHEAT_PENALTY_SCORE"] = (100 - df["PRICE_CONTEXT_SCORE"]).clip(0, 100).round(1)
     df["PREFERENCE_FIT_SCORE"] = (
-        df["COMMUTE_FIT_SCORE"] * convenience_weight
-        + df["LIFESTYLE_FIT_SCORE"] * lifestyle_weight
+        df["COMMUTE_FIT_SCORE"] * convenience_weight * (1 - scope_weight)
+        + df["LIFESTYLE_FIT_SCORE"] * lifestyle_weight * (1 - scope_weight)
+        + df["SCOPE_FIT_SCORE"] * scope_weight
     ).round(1)
+    df["SCOPE_PRIORITY_ADJUSTMENT"] = (
+        (df["SCOPE_FIT_SCORE"] - scope_adjust_baseline) * scope_adjust_scale
+    ).clip(-8, 10).round(1)
 
     # 하이브리드 추천점수
     # 룰 기반: 가중평균 (합 = 1.0) → 안전 60% + 손실회피 15% + 가격적정 5% + 선호적합 12% + 유사도 8%
@@ -640,6 +684,7 @@ def build_recommendation_dataset(
         + (100 - df["PRICE_OVERHEAT_PENALTY_SCORE"]) * w_price_n
         + df["PREFERENCE_FIT_SCORE"] * w_pref_n
         + df["SIMILARITY_SCORE"] * w_sim_n
+        + df["SCOPE_PRIORITY_ADJUSTMENT"]
     ).clip(0, 100)
 
     # ML: ML_RISK_SCORE가 높을수록 위험 → (100 - ML_RISK_SCORE)가 안전 점수

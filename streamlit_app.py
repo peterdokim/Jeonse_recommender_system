@@ -1,4 +1,9 @@
+from __future__ import annotations
+
+import html
 import json
+import re
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 
 import altair as alt
@@ -201,6 +206,238 @@ def _extract_cortex_text(value: object) -> str:
     return text
 
 
+def _normalize_ai_text(value: object, *, max_chars: int) -> str:
+    if not isinstance(value, str):
+        return ""
+
+    text = value.replace("\u200b", " ").replace("\ufeff", " ")
+    text = re.sub(r"\s+", " ", text).strip().strip("`").strip()
+    if not text:
+        return ""
+
+    if len(text) > max_chars:
+        text = text[:max_chars].rstrip()
+        if " " in text[-20:]:
+            text = text.rsplit(" ", 1)[0]
+        text = text.rstrip(" ,.;:") + "..."
+
+    return text
+
+
+def _has_degenerate_repetition(text: str) -> bool:
+    normalized = re.sub(r"\s+", "", text)
+    if len(normalized) > 220:
+        return True
+
+    tokens = re.findall(r"[가-힣A-Za-z0-9]+", text)
+    if len(tokens) < 12:
+        return False
+
+    for n in (4, 5, 6):
+        if len(tokens) < n:
+            continue
+        ngrams = [" ".join(tokens[i : i + n]) for i in range(len(tokens) - n + 1)]
+        if not ngrams:
+            continue
+        _, count = Counter(ngrams).most_common(1)[0]
+        if count >= 3:
+            return True
+
+    return False
+
+
+def _is_unusable_ai_text(text: str) -> bool:
+    if not text:
+        return True
+
+    normalized = re.sub(r"[^가-힣A-Za-z0-9]+", "", text)
+    banned_phrases = (
+        "전세가를받는입장",
+        "임대인입장",
+        "집주인입장",
+        "투자자입장",
+        "수익을기대",
+        "투자수익",
+        "매수관점",
+    )
+    if any(phrase in normalized for phrase in banned_phrases):
+        return True
+
+    if "```" in text or text.count("{") + text.count("}") >= 2:
+        return True
+
+    return _has_degenerate_repetition(text)
+
+
+def _normalize_ai_list(value: object, *, max_items: int, max_chars: int) -> list[str]:
+    if not isinstance(value, list):
+        return []
+
+    items: list[str] = []
+    seen: set[str] = set()
+    for raw_item in value:
+        if not isinstance(raw_item, str):
+            continue
+
+        raw_text = re.sub(r"\s+", " ", raw_item).strip()
+        if not raw_text:
+            continue
+        if len(re.sub(r"\s+", "", raw_text)) > max_chars * 1.5:
+            continue
+        if _is_unusable_ai_text(raw_text):
+            continue
+
+        cleaned = _normalize_ai_text(raw_text, max_chars=max_chars)
+        if not cleaned or _is_unusable_ai_text(cleaned):
+            continue
+
+        dedupe_key = re.sub(r"[^가-힣A-Za-z0-9]+", "", cleaned)
+        if not dedupe_key or dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        items.append(cleaned)
+
+        if len(items) >= max_items:
+            break
+
+    return items
+
+
+def _merge_unique_items(primary: list[str], fallback: list[str], *, max_items: int) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+
+    for item in [*primary, *fallback]:
+        key = re.sub(r"[^가-힣A-Za-z0-9]+", "", item)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        merged.append(item)
+        if len(merged) >= max_items:
+            break
+
+    return merged
+
+
+def build_fallback_ai_analysis(
+    selected_area: str,
+    grade_label: str,
+    candidate_row: pd.Series,
+    survey_result: dict[str, object],
+) -> dict[str, object]:
+    grade_code = str(candidate_row.get("GRADE", ""))
+    grade_meaning = GRADE_MEANINGS.get(grade_code, "참고")
+    rate = float(candidate_row.get("JEONSE_RATE", 0))
+    s_mig = float(candidate_row.get("S_MIG", 50))
+    s_sub = float(candidate_row.get("S_SUB", 50))
+    ml_risk = float(candidate_row.get("ML_RISK_SCORE", 50))
+    profile = str(survey_result.get("profile", "중도위험형"))
+
+    if rate >= 85:
+        summary = (
+            f"{selected_area}은 {grade_label} 지역이지만 전세가가 매매가에 매우 가까운 편이라 "
+            f"보증금 안전성은 특히 신중하게 확인해 보시는 편이 좋습니다."
+        )
+    elif rate >= 70:
+        summary = (
+            f"{selected_area}은 {grade_label} 지역으로 기본 체력은 살펴볼 만하지만, "
+            f"전세가가 매매가에 다소 가까워 계약 전 조건 확인이 중요해 보입니다."
+        )
+    else:
+        summary = (
+            f"{selected_area}은 {grade_label} 지역으로, 전세가율과 최근 흐름을 함께 보면 "
+            f"보증금 회수 측면에서 비교적 안정적으로 검토해볼 여지가 있습니다."
+        )
+
+    strengths: list[str] = []
+    if str(candidate_row.get("GRADE", "")) in {"A", "B"}:
+        strengths.append(f"안전등급이 {grade_code}등급({grade_meaning})으로 분류되어 기본 위험도는 비교적 낮은 편입니다.")
+    if s_sub >= 60:
+        strengths.append("최근 전세가 흐름이 비교적 안정적인 편이라 급격한 가격 흔들림 우려가 상대적으로 적습니다.")
+    if s_mig >= 60:
+        strengths.append("최근 거래가 꾸준한 편이라 시세를 가늠할 근거가 비교적 충분합니다.")
+    if rate < 70:
+        strengths.append("전세가가 매매가에 과도하게 붙어 있지 않아 보증금 회수 측면에서 상대적으로 여유가 있습니다.")
+    if not strengths:
+        strengths.append("현재 공개된 지표 기준으로는 극단적인 위험 신호만 바로 나타나는 상황은 아닙니다.")
+
+    risks: list[str] = []
+    if rate >= 70:
+        risks.append("전세가가 매매가에 가까운 편이라 보증금 안전성은 계약 전에 더 꼼꼼히 보셔야 합니다.")
+    if ml_risk >= 60:
+        risks.append("향후 전세가 하락 가능성이 높은 편이라 최근 실거래 흐름을 한 번 더 확인해 보시는 것이 좋습니다.")
+    elif ml_risk >= 40:
+        risks.append("향후 전세가 흐름이 다소 흔들릴 수 있어 현재 시세가 과열된 것은 아닌지 점검이 필요합니다.")
+    if s_sub < 50:
+        risks.append("최근 가격 변동성이 있는 편이라 시점에 따라 체감 위험이 달라질 수 있습니다.")
+    if s_mig < 40:
+        risks.append("최근 거래가 많지 않다면 실제 체결 시세를 판단하기가 다소 어려울 수 있습니다.")
+    if not risks:
+        risks.append("절대적인 위험 신호가 크지 않더라도 권리관계와 보증보험 가능 여부는 꼭 따로 확인하셔야 합니다.")
+
+    action_map = {
+        "보수형": "보수형 성향이시라면 비슷한 예산의 상위 대안과 함께 비교하시고, 보증보험 가능 여부와 선순위 권리관계를 먼저 확인해 보세요.",
+        "중도위험형": "현재 후보를 유지하시더라도 비슷한 예산의 대안과 전세가율, 최근 거래 흐름을 나란히 비교해 보시는 것을 권합니다.",
+        "모험형": "생활권 장점을 보시더라도 최근 실거래 흐름과 보증보험 가능 여부는 꼭 함께 확인하신 뒤 판단해 보세요.",
+    }
+
+    return {
+        "summary": summary,
+        "strengths": strengths[:3],
+        "risks": risks[:3],
+        "recommended_action": action_map.get(profile, action_map["중도위험형"]),
+        "confidence": "low",
+    }
+
+
+def sanitize_ai_analysis(
+    raw_analysis: object,
+    *,
+    selected_area: str,
+    grade_label: str,
+    candidate_row: pd.Series,
+    survey_result: dict[str, object],
+) -> dict[str, object]:
+    base = raw_analysis if isinstance(raw_analysis, dict) else {}
+    raw_strengths = base.get("strengths", []) if isinstance(base.get("strengths", []), list) else []
+    raw_risks = base.get("risks", []) if isinstance(base.get("risks", []), list) else []
+    fallback = build_fallback_ai_analysis(
+        selected_area=selected_area,
+        grade_label=grade_label,
+        candidate_row=candidate_row,
+        survey_result=survey_result,
+    )
+
+    summary = _normalize_ai_text(base.get("summary", ""), max_chars=180)
+    summary_valid = bool(summary) and not _is_unusable_ai_text(summary)
+    if not summary_valid:
+        summary = str(fallback["summary"])
+
+    strengths = _normalize_ai_list(raw_strengths, max_items=3, max_chars=110)
+    strengths = _merge_unique_items(strengths, list(fallback["strengths"]), max_items=3)
+
+    risks = _normalize_ai_list(raw_risks, max_items=3, max_chars=110)
+    risks = _merge_unique_items(risks, list(fallback["risks"]), max_items=3)
+
+    action = _normalize_ai_text(base.get("recommended_action", ""), max_chars=140)
+    if not action or _is_unusable_ai_text(action):
+        action = str(fallback["recommended_action"])
+
+    confidence = str(base.get("confidence", "medium")).lower()
+    if confidence not in {"high", "medium", "low"}:
+        confidence = "medium"
+    if not summary_valid or strengths != raw_strengths[: len(strengths)] or risks != raw_risks[: len(risks)]:
+        confidence = "low"
+
+    return {
+        "summary": summary,
+        "strengths": strengths,
+        "risks": risks,
+        "recommended_action": action,
+        "confidence": confidence,
+    }
+
+
 @st.cache_data(show_spinner=False)
 def get_candidate_ai_summary(_session, prompt: str) -> str:
     try:
@@ -376,7 +613,8 @@ def build_candidate_ai_prompt(
 
     return (
         f"당신은 서울 부동산 시장의 전세 데이터를 해석해 고객에게 안내하는 분석가입니다.\n"
-        f"아래 제공된 데이터만을 근거로 **{selected_area}**의 전세 환경을 분석해 주세요.\n\n"
+        f"아래 제공된 데이터만을 근거로 **{selected_area}**의 전세 환경을 분석해 주세요.\n"
+        f"독자는 전세 계약을 검토 중인 세입자이며, 설명은 반드시 세입자 관점으로만 작성해 주세요.\n\n"
         "**반드시 지켜야 할 규칙:**\n"
         f"1. **검증 불가능한 구체 사실을 절대 지어내지 마세요.** 다음은 모두 금지입니다:\n"
         "   - 지하철 노선 번호 (예: '2호선이 지나는', '7호선 역세권')\n"
@@ -388,6 +626,7 @@ def build_candidate_ai_prompt(
         "2. 대신 **아래 제공된 데이터(전세가율, 거래 활발도, 가격 안정성, 등급, 시장 흐름)만**을 자연어로 풀어 설명하세요. "
         f"동네 이름 '{emd}'은 언급하되, 그 동네의 일반적 분위기(예: '주거 밀집 지역', '거래가 활발한 동네')를 데이터 기반으로만 표현하세요.\n"
         "3. **모든 문장은 정중한 존댓말 (~입니다, ~합니다, ~보입니다, ~해보세요)을 사용**하세요. 반말·단정조 금지.\n"
+        "3-1. **세입자 관점만 사용**하세요. 임대인·집주인·투자자·수익 관점 설명은 금지입니다.\n"
         "4. **표현 톤은 부드럽고 차분하게**. 자극적·과장된 단어 금지.\n"
         "   ❌ 너무 강함: '집주인이 보증금을 돌려주지 못할 위험이 큽니다'\n"
         "   ✅ 좋음: '전세가가 매매가에 거의 근접해 깡통전세 위험에 유의가 필요한 상황입니다'\n"
@@ -1073,7 +1312,7 @@ st.markdown(
     f'</div>'
     f'<div style="margin-top:0.7rem;padding-top:0.7rem;border-top:1px solid #e8eee9;'
     f'font-size:0.8rem;color:#666;line-height:1.55">'
-    f'동네 안전도, AI 하락 예측, 회원님의 보증금·성향·평형을 모두 반영한 종합 점수입니다.'
+    f'동네 안전도, AI 하락 예측, 회원님의 보증금·성향·평형·탐색 범위를 모두 반영한 종합 점수입니다.'
     f'</div>'
     f'</div>',
     unsafe_allow_html=True,
@@ -1169,6 +1408,13 @@ market_rankings = load_market_rankings(session)
 if _ai_warm:
     # 캐시 hit — 즉시 응답 (실제로는 ms 단위)
     analysis = get_ai_structured_analysis(session, _ai_cache_key, cortex_prompt)
+    analysis = sanitize_ai_analysis(
+        analysis,
+        selected_area=selected_area,
+        grade_label=grade_label,
+        candidate_row=candidate_row,
+        survey_result=survey_result,
+    )
 else:
     # 1차 렌더: 빈 placeholder
     analysis = None
@@ -1251,7 +1497,7 @@ with tabs[0]:
                 alt.Tooltip("JEONSE_RATE:Q", title="전세가율(%)", format=".1f"),
             ],
         )
-        st.altair_chart(chart, width="stretch")
+        st.altair_chart(chart, use_container_width=True)
 
     # 안전등급 가이드
     st.caption(
@@ -1433,6 +1679,7 @@ with tabs[1]:
         confidence = analysis.get("confidence", "medium")
         conf_label = {"high": "신뢰도 높음", "medium": "신뢰도 보통", "low": "신뢰도 낮음"}.get(confidence, "신뢰도 보통")
         conf_color = {"high": "#2e7d32", "medium": "#f57f17", "low": "#c62828"}.get(confidence, "#666")
+        summary_html = html.escape(str(analysis.get("summary", "")), quote=False)
 
         # 헤더 + 총평 (단일 hero 카드)
         st.markdown(
@@ -1448,7 +1695,7 @@ with tabs[1]:
             f'padding:3px 10px;border-radius:999px;font-size:0.7rem;font-weight:600">{conf_label}</span>'
             f'</div>'
             f'<div style="font-size:1.1rem;font-weight:600;color:#1a1a1a;line-height:1.6">'
-            f'{analysis.get("summary", "")}</div>'
+            f'{summary_html}</div>'
             f'</div>',
             unsafe_allow_html=True,
         )
@@ -1456,11 +1703,14 @@ with tabs[1]:
         # 강점 / 주의 / 추천 행동 (3열)
         strengths = analysis.get("strengths", [])
         risks = analysis.get("risks", [])
-        action = analysis.get("recommended_action", "")
+        action = html.escape(str(analysis.get("recommended_action", "")), quote=False)
 
         col_s, col_r, col_a = st.columns(3)
         with col_s:
-            items = "".join(f'<li style="margin-bottom:6px;line-height:1.5">{s}</li>' for s in strengths[:3])
+            items = "".join(
+                f'<li style="margin-bottom:6px;line-height:1.5">{html.escape(str(s), quote=False)}</li>'
+                for s in strengths[:3]
+            )
             st.markdown(
                 f'<div style="background:#fff;border:1px solid #c8e0d2;border-left:4px solid #4caf50;'
                 f'border-radius:10px;padding:1rem 1.1rem;height:100%">'
@@ -1473,7 +1723,10 @@ with tabs[1]:
                 unsafe_allow_html=True,
             )
         with col_r:
-            items = "".join(f'<li style="margin-bottom:6px;line-height:1.5">{r}</li>' for r in risks[:3])
+            items = "".join(
+                f'<li style="margin-bottom:6px;line-height:1.5">{html.escape(str(r), quote=False)}</li>'
+                for r in risks[:3]
+            )
             st.markdown(
                 f'<div style="background:#fff;border:1px solid #f0d4c4;border-left:4px solid #ff9800;'
                 f'border-radius:10px;padding:1rem 1.1rem;height:100%">'
@@ -1527,7 +1780,7 @@ with tabs[1]:
                             scale=alt.Scale(scheme="greens", domain=[0, 100])),
             tooltip=["항목", alt.Tooltip("점수:Q", format=".0f")],
         ).properties(height=120),
-        width="stretch",
+        use_container_width=True,
     )
 
     # ── 위기 시뮬레이션 ──
@@ -1677,7 +1930,7 @@ with tabs[2]:
                     color=alt.Color("AREA_LABEL:N", title="동네"),
                     tooltip=["AREA_LABEL", "월:N", alt.Tooltip("JEONSE_PRICE:Q", format=",.0f", title="만원")],
                 ),
-                width="stretch",
+                use_container_width=True,
             )
             chart_right.altair_chart(
                 alt.Chart(combined_history).mark_line(point=True).encode(
@@ -1686,7 +1939,7 @@ with tabs[2]:
                     color=alt.Color("AREA_LABEL:N", title="동네"),
                     tooltip=["AREA_LABEL", "월:N", alt.Tooltip("JEONSE_RATIO:Q", format=".1f", title="%")],
                 ),
-                width="stretch",
+                use_container_width=True,
             )
 
         compare_table = compare_rows[
@@ -1987,7 +2240,7 @@ with tabs[3]:
             f'{selected_area} 매매가·전세가 추이</div>',
             unsafe_allow_html=True,
         )
-        st.altair_chart(make_history_chart(selected_history_df), width="stretch")
+        st.altair_chart(make_history_chart(selected_history_df), use_container_width=True)
 
     # ── 최근 실거래 내역 ──
     st.markdown('<div style="height:1.6rem"></div>', unsafe_allow_html=True)
