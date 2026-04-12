@@ -1361,18 +1361,18 @@ with tabs[1]:
     structural_score = pd.to_numeric(pd.Series([candidate_row.get("STRUCTURAL_SCORE")]), errors="coerce").iloc[0]
     score_gap = pd.to_numeric(pd.Series([candidate_row.get("MARKET_STRUCTURE_GAP")]), errors="coerce").iloc[0]
 
-    cmp_1, cmp_2, cmp_3 = st.columns(3)
-    cmp_1.metric(
-        "국토부 시장 점수",
+    cmp_top_left, cmp_top_right = st.columns(2)
+    cmp_top_left.metric(
+        "시장 점수",
         f"{market_score:.1f}점",
         help="국토부 실거래 기반 전세가율, 거래 활발도, 변동성으로 만든 시장 점수",
     )
-    cmp_2.metric(
-        "구조 비교 점수",
+    cmp_top_right.metric(
+        "구조 점수",
         f"{float(structural_score):.1f}점" if pd.notna(structural_score) else "-",
-        help="리치고 구조 신호와 SPH/Grandata 생활·재무 신호를 합친 구조 점수",
+        help="리치고 구조 신호와 SPH/Grandata 생활·재무 신호를 합친 비교용 구조 점수",
     )
-    cmp_3.metric(
+    st.metric(
         "점수 차이",
         f"{abs(float(score_gap)):.1f}점" if pd.notna(score_gap) else "-",
         delta=str(candidate_row.get("GAP_DIRECTION_LABEL", "비교 데이터 부족")),
@@ -1400,23 +1400,25 @@ with tabs[1]:
     )
 
     if bool(candidate_row.get("HAS_STRUCTURE_SIGNAL", False)):
-        comp_1, comp_2, comp_3, comp_4 = st.columns(4)
-        comp_1.metric(
+        st.markdown("##### 구조 점수 구성")
+        comp_top_1, comp_top_2 = st.columns(2)
+        comp_top_1.metric(
             "리치고 구조",
             f"{float(candidate_row['RICHGO_STRUCTURE_SCORE']):.1f}점" if pd.notna(candidate_row.get("RICHGO_STRUCTURE_SCORE")) else "-",
             help="리치고의 지하철 거리와 순이동 신호를 합친 구조 점수",
         )
-        comp_2.metric(
+        comp_top_2.metric(
             "SPH 활동",
             f"{float(candidate_row['SPH_ACTIVITY_SCORE']):.1f}점" if pd.notna(candidate_row.get("SPH_ACTIVITY_SCORE")) else "-",
             help="SPH/Grandata의 근무·방문·거주 인구 신호를 합친 점수",
         )
-        comp_3.metric(
+        comp_bottom_1, comp_bottom_2 = st.columns(2)
+        comp_bottom_1.metric(
             "SPH 재무",
             f"{float(candidate_row['SPH_FINANCE_SCORE']):.1f}점" if pd.notna(candidate_row.get("SPH_FINANCE_SCORE")) else "-",
             help="SPH/Grandata의 소득·자산 신호를 합친 점수",
         )
-        comp_4.metric(
+        comp_bottom_2.metric(
             "시세 일치도",
             f"{float(candidate_row['RATE_CONSISTENCY_SCORE']):.1f}점" if pd.notna(candidate_row.get("RATE_CONSISTENCY_SCORE")) else "-",
             help="국토부 전세가율과 리치고 전세가율이 얼마나 비슷한지 보여주는 점수",
