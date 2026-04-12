@@ -88,6 +88,16 @@ NUMERIC_COLUMNS = [
     "RES_POP",
     "WORK_POP",
     "VISIT_POP",
+    "RICHGO_JEONSE_RATE",
+    "RICHGO_JEONSE_DROP_PCT",
+    "RICHGO_NET_MIG",
+    "RICHGO_SUBWAY_DIST",
+    "RICHGO_S_RATE",
+    "RICHGO_S_MIG",
+    "RICHGO_S_SUB",
+    "RICHGO_TOTAL_SCORE",
+    "ML_RISK_SCORE",
+    "ML_DROP_PROB",
 ]
 
 
@@ -131,6 +141,101 @@ def percentile_score(series: pd.Series, higher_is_better: bool = True, fill_valu
         return pd.Series(fill_value, index=series.index, dtype="float64")
     ranked = numeric.rank(pct=True, method="average", ascending=higher_is_better) * 100
     return ranked.fillna(fill_value).round(1)
+
+
+def weighted_available_score(parts) -> pd.Series:
+    if not parts:
+        return pd.Series(dtype="float64")
+
+    base_index = parts[0][0].index
+    weighted_sum = pd.Series(0.0, index=base_index, dtype="float64")
+    weight_sum = pd.Series(0.0, index=base_index, dtype="float64")
+
+    for series, weight in parts:
+        numeric = pd.to_numeric(series, errors="coerce")
+        available = numeric.notna()
+        weighted_sum = weighted_sum + numeric.fillna(0) * weight
+        weight_sum = weight_sum + available.astype(float) * weight
+
+    result = weighted_sum / weight_sum.where(weight_sum > 0)
+    return result.round(1)
+
+
+def grade_from_score(score: float) -> str:
+    if pd.isna(score):
+        return "-"
+    if score >= 80:
+        return "A"
+    if score >= 60:
+        return "B"
+    if score >= 40:
+        return "C"
+    return "D"
+
+
+def structure_data_label(has_richgo: bool, has_grandata: bool) -> str:
+    if has_richgo and has_grandata:
+        return "리치고 + SPH/Grandata"
+    if has_richgo:
+        return "리치고"
+    if has_grandata:
+        return "SPH/Grandata"
+    return "비교 데이터 부족"
+
+
+def score_gap_label(gap: float) -> str:
+    if pd.isna(gap):
+        return "비교 데이터 부족"
+    if gap >= 5:
+        return "구조 우세"
+    if gap <= -5:
+        return "시장 우세"
+    return "유사"
+
+
+def comparison_label(market_score: float, structural_score: float) -> str:
+    if pd.isna(structural_score):
+        return "구조 비교 데이터 부족"
+
+    market_safe = market_score >= 65
+    structural_safe = structural_score >= 65
+
+    if market_safe and structural_safe:
+        return "시장·구조 모두 안전"
+    if market_safe and not structural_safe:
+        return "시장 강세·구조 보완 필요"
+    if not market_safe and structural_safe:
+        return "구조 우수·시장 약세"
+    return "시장·구조 모두 주의"
+
+
+def comparison_detail(
+    market_score: float,
+    structural_score: float,
+    data_label: str,
+) -> str:
+    if pd.isna(structural_score):
+        return "리치고 또는 SPH 구조 신호가 부족해 현재는 국토부 실거래 기반 시장 점수 중심으로 해석합니다."
+
+    gap = structural_score - market_score
+    label = comparison_label(market_score, structural_score)
+
+    if label == "시장·구조 모두 안전":
+        detail = "최근 실거래 흐름과 구조 신호가 함께 양호한 후보입니다."
+    elif label == "시장 강세·구조 보완 필요":
+        detail = "최근 시장 흐름은 괜찮지만 구조 체력은 조금 더 보수적으로 볼 필요가 있습니다."
+    elif label == "구조 우수·시장 약세":
+        detail = "리치고와 SPH 기준 구조 체력은 양호하지만 최근 시장 흐름은 조금 더 확인이 필요합니다."
+    else:
+        detail = "시장 흐름과 구조 신호 모두 보수적으로 점검해야 하는 후보입니다."
+
+    if abs(gap) >= 10:
+        if gap > 0:
+            detail += " 구조 점수가 더 높아 장기 체력 관점의 재평가 여지가 있습니다."
+        else:
+            detail += " 시장 점수보다 구조 점수가 낮아 장기 안전성은 한 번 더 점검하는 편이 좋습니다."
+
+    return f"{detail} 구조 비교는 {data_label} 신호를 사용했습니다."
 
 
 def detect_price_unit_multiplier(df: pd.DataFrame) -> int:
@@ -353,6 +458,7 @@ def build_recommendation_dataset(
     df["VISIT_POP_SCORE"] = percentile_score(df["VISIT_POP"], higher_is_better=True)
     df["RES_POP_SCORE"] = percentile_score(df["RES_POP"], higher_is_better=True)
     df["INCOME_SCORE"] = percentile_score(df["AVG_INCOME"], higher_is_better=True)
+    df["ASSET_SCORE"] = percentile_score(df["AVG_ASSET"], higher_is_better=True)
     df["LOSS_EXPOSURE_SCORE"] = percentile_score(df["LOSS_EXPOSURE_AMOUNT"], higher_is_better=False)
     df["PRICE_CONTEXT_SCORE"] = (
         percentile_score(df["JEONSE_RATE"], higher_is_better=False) * 0.65
@@ -385,6 +491,84 @@ def build_recommendation_dataset(
         + df["S_MIG"].fillna(50) * 0.10
         + df["S_SUB"].fillna(50) * 0.10
     ).round(1)
+
+    df["HAS_GRANDATA_SIGNAL"] = df[["AVG_ASSET", "AVG_INCOME", "RES_POP", "WORK_POP", "VISIT_POP"]].notna().any(axis=1)
+
+    richgo_sub = pd.to_numeric(df["RICHGO_S_SUB"], errors="coerce").where(df["HAS_RICHGO_SIGNAL"].fillna(False))
+    richgo_mig = pd.to_numeric(df["RICHGO_S_MIG"], errors="coerce").where(df["HAS_RICHGO_SIGNAL"].fillna(False))
+    grandata_work = df["WORK_POP_SCORE"].where(df["WORK_POP"].notna())
+    grandata_visit = df["VISIT_POP_SCORE"].where(df["VISIT_POP"].notna())
+    grandata_res = df["RES_POP_SCORE"].where(df["RES_POP"].notna())
+    grandata_income = df["INCOME_SCORE"].where(df["AVG_INCOME"].notna())
+    grandata_asset = df["ASSET_SCORE"].where(df["AVG_ASSET"].notna())
+
+    df["RICHGO_STRUCTURE_SCORE"] = weighted_available_score(
+        [
+            (richgo_sub, 0.55),
+            (richgo_mig, 0.45),
+        ]
+    )
+    df["SPH_ACTIVITY_SCORE"] = weighted_available_score(
+        [
+            (grandata_work, 0.45),
+            (grandata_visit, 0.35),
+            (grandata_res, 0.20),
+        ]
+    )
+    df["SPH_FINANCE_SCORE"] = weighted_available_score(
+        [
+            (grandata_income, 0.60),
+            (grandata_asset, 0.40),
+        ]
+    )
+
+    rate_consistency = (
+        100
+        - (
+            pd.to_numeric(df["JEONSE_RATE"], errors="coerce")
+            - pd.to_numeric(df["RICHGO_JEONSE_RATE"], errors="coerce")
+        ).abs()
+        * 4
+    ).clip(0, 100)
+    df["RATE_CONSISTENCY_SCORE"] = rate_consistency.where(
+        pd.to_numeric(df["RICHGO_JEONSE_RATE"], errors="coerce").notna()
+    ).round(1)
+
+    df["MARKET_SCORE"] = df["TOTAL_SCORE"].fillna(0).round(1)
+    df["STRUCTURAL_SCORE"] = weighted_available_score(
+        [
+            (df["RICHGO_STRUCTURE_SCORE"], 0.45),
+            (df["SPH_ACTIVITY_SCORE"], 0.25),
+            (df["SPH_FINANCE_SCORE"], 0.20),
+            (df["RATE_CONSISTENCY_SCORE"], 0.10),
+        ]
+    )
+    df["HAS_STRUCTURE_SIGNAL"] = df["STRUCTURAL_SCORE"].notna()
+    df["STRUCTURAL_GRADE"] = df["STRUCTURAL_SCORE"].apply(grade_from_score)
+    df["MARKET_STRUCTURE_GAP"] = (df["STRUCTURAL_SCORE"] - df["MARKET_SCORE"]).round(1)
+    df["STRUCTURE_DATA_LABEL"] = df.apply(
+        lambda row: structure_data_label(
+            bool(row.get("HAS_RICHGO_SIGNAL", False)),
+            bool(row.get("HAS_GRANDATA_SIGNAL", False)),
+        ),
+        axis=1,
+    )
+    df["GAP_DIRECTION_LABEL"] = df["MARKET_STRUCTURE_GAP"].apply(score_gap_label)
+    df["COMPARISON_LABEL"] = df.apply(
+        lambda row: comparison_label(
+            float(row.get("MARKET_SCORE", 0)),
+            pd.to_numeric(pd.Series([row.get("STRUCTURAL_SCORE")]), errors="coerce").iloc[0],
+        ),
+        axis=1,
+    )
+    df["COMPARISON_DETAIL"] = df.apply(
+        lambda row: comparison_detail(
+            float(row.get("MARKET_SCORE", 0)),
+            pd.to_numeric(pd.Series([row.get("STRUCTURAL_SCORE")]), errors="coerce").iloc[0],
+            str(row.get("STRUCTURE_DATA_LABEL", "비교 데이터 부족")),
+        ),
+        axis=1,
+    )
 
     candidate_mask = df["AREA_LABEL"] == candidate_area
     candidate_row = df.loc[candidate_mask].iloc[0]
@@ -425,7 +609,7 @@ def build_recommendation_dataset(
     convenience_weight = 0.35 + float(survey_result["convenience_preference"]) / 100 * 0.30
     lifestyle_weight = 1 - convenience_weight
 
-    df["SAFETY_SCORE"] = df["TOTAL_SCORE"].fillna(0).round(1)
+    df["SAFETY_SCORE"] = df["MARKET_SCORE"]
     df["LOSS_PENALTY_SCORE"] = (100 - df["LOSS_EXPOSURE_SCORE"]).clip(0, 100).round(1)
     df["PRICE_OVERHEAT_PENALTY_SCORE"] = (100 - df["PRICE_CONTEXT_SCORE"]).clip(0, 100).round(1)
     df["PREFERENCE_FIT_SCORE"] = (
@@ -568,6 +752,11 @@ def build_card_description(
     if grade_order.get(str(row.get("GRADE", "")), 9) < grade_order.get(str(candidate_row.get("GRADE", "")), 9):
         points.append(f"안전등급 **{row['GRADE']}**로 더 안전")
 
+    row_structural = pd.to_numeric(pd.Series([row.get("STRUCTURAL_SCORE")]), errors="coerce").iloc[0]
+    cand_structural = pd.to_numeric(pd.Series([candidate_row.get("STRUCTURAL_SCORE")]), errors="coerce").iloc[0]
+    if pd.notna(row_structural) and pd.notna(cand_structural) and row_structural >= cand_structural + 8:
+        points.append(f"구조 비교 점수 **{row_structural:.1f}점**으로 장기 체력이 더 안정적")
+
     if str(row.get("SGG", "")) == str(candidate_row.get("SGG", "")):
         points.append("같은 구라 **생활권 유지**")
 
@@ -580,12 +769,19 @@ def build_card_description(
 
 def build_candidate_summary(row: pd.Series, survey_result: Dict[str, Any]) -> str:
     grade_meaning = GRADE_MEANINGS.get(row["GRADE"], "참고")
-    return (
+    summary = (
         f"{row['AREA_LABEL']}은 공통 안전등급 {row['GRADE']}({grade_meaning})이며 "
         f"객관 레이어인 안전점수는 {row['SAFETY_SCORE']:.1f}점입니다. "
         f"이 위에 설문으로 분류된 {survey_result['profile']} 성향을 반영해 "
         f"손실 패널티와 선호 적합도를 다시 계산한 최종 추천점수는 {row['RECOMMENDATION_SCORE']:.1f}점입니다."
     )
+    structural_score = pd.to_numeric(pd.Series([row.get("STRUCTURAL_SCORE")]), errors="coerce").iloc[0]
+    if pd.notna(structural_score):
+        summary += (
+            f" 국토부 시장 점수는 {row['MARKET_SCORE']:.1f}점, "
+            f"리치고+SPH 구조 비교 점수는 {structural_score:.1f}점입니다."
+        )
+    return summary
 
 
 def build_profile_summary(survey_result: Dict[str, Any]) -> str:
@@ -621,6 +817,11 @@ def build_recommendation_reasons(
 
     if float(row["PREFERENCE_FIT_SCORE"]) > float(candidate_row["PREFERENCE_FIT_SCORE"]):
         reasons.append("생활권 적합도가 더 높아 설문 응답 기준 선호 조건과 더 잘 맞습니다.")
+
+    row_structural = pd.to_numeric(pd.Series([row.get("STRUCTURAL_SCORE")]), errors="coerce").iloc[0]
+    cand_structural = pd.to_numeric(pd.Series([candidate_row.get("STRUCTURAL_SCORE")]), errors="coerce").iloc[0]
+    if pd.notna(row_structural) and pd.notna(cand_structural) and row_structural > cand_structural + 8:
+        reasons.append(f"구조 비교 점수도 현재 후보보다 {row_structural - cand_structural:.1f}점 높습니다.")
 
     if str(row["SGG"]) == str(candidate_row["SGG"]):
         reasons.append("현재 관심 구를 유지하면서 더 안전한 대안을 제시합니다.")

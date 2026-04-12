@@ -1243,8 +1243,11 @@ with tabs[0]:
             color=alt.condition(alt.datum.IS_CANDIDATE, alt.value("#ef6c00"), alt.value("#2d7a52")),
             tooltip=[
                 alt.Tooltip("AREA_LABEL:N", title="동네"),
-                alt.Tooltip("RECOMMENDATION_SCORE:Q", title="점수", format=".1f"),
+                alt.Tooltip("RECOMMENDATION_SCORE:Q", title="추천점수", format=".1f"),
                 alt.Tooltip("GRADE:N", title="안전등급"),
+                alt.Tooltip("MARKET_SCORE:Q", title="시장 점수", format=".1f"),
+                alt.Tooltip("STRUCTURAL_SCORE:Q", title="구조 점수", format=".1f"),
+                alt.Tooltip("COMPARISON_LABEL:N", title="비교 해석"),
                 alt.Tooltip("JEONSE_RATE:Q", title="전세가율(%)", format=".1f"),
             ],
         )
@@ -1263,10 +1266,10 @@ with tabs[0]:
             "AREA_LABEL",
             "GRADE",
             "RECOMMENDATION_SCORE",
-            "JEONSE_RATE",
-            "ESTIMATED_TOTAL_JEONSE",
-            "RICHGO_TOTAL_SCORE",
-            "RICHGO_GRADE",
+            "MARKET_SCORE",
+            "STRUCTURAL_SCORE",
+            "MARKET_STRUCTURE_GAP",
+            "COMPARISON_LABEL",
         ]
     ].copy()
     recommendation_table["RECOMMENDATION_RANK"] = recommendation_table["RECOMMENDATION_RANK"].apply(
@@ -1281,23 +1284,22 @@ with tabs[0]:
             "AREA_LABEL": "동네",
             "GRADE": "안전등급",
             "RECOMMENDATION_SCORE": "나의 적합도",
-            "JEONSE_RATE": "전세가율",
-            "ESTIMATED_TOTAL_JEONSE": "예상 전세가",
-            "RICHGO_TOTAL_SCORE": "리치고 점수",
-            "RICHGO_GRADE": "리치고 등급",
+            "MARKET_SCORE": "시장 점수",
+            "STRUCTURAL_SCORE": "구조 점수",
+            "MARKET_STRUCTURE_GAP": "점수 차이",
+            "COMPARISON_LABEL": "비교 해석",
         }
     )
-    recommendation_table["예상 전세가"] = recommendation_table["예상 전세가"].map(format_currency_krw)
-    recommendation_table["전세가율"] = recommendation_table["전세가율"].map(lambda v: f"{v:.1f}%")
     recommendation_table["나의 적합도"] = recommendation_table["나의 적합도"].map(lambda v: f"{v:.1f}점")
-    recommendation_table["리치고 점수"] = recommendation_table["리치고 점수"].apply(
+    recommendation_table["시장 점수"] = recommendation_table["시장 점수"].map(lambda v: f"{v:.1f}점")
+    recommendation_table["구조 점수"] = recommendation_table["구조 점수"].apply(
         lambda v: f"{float(v):.1f}점" if pd.notna(v) else "-"
     )
-    recommendation_table["리치고 등급"] = recommendation_table["리치고 등급"].apply(
-        lambda v: str(v) if pd.notna(v) and str(v).strip() else "-"
+    recommendation_table["점수 차이"] = recommendation_table["점수 차이"].apply(
+        lambda v: f"{float(v):+.1f}점" if pd.notna(v) else "-"
     )
     st.dataframe(recommendation_table, width="stretch", hide_index=True)
-    st.caption("리치고 점수와 등급은 현재 비교용 보조 지표이며, 아직 최종 추천 점수에는 직접 반영되지 않습니다.")
+    st.caption("시장 점수는 국토부 실거래 기반, 구조 점수는 리치고+SPH/Grandata 기반 비교 지표입니다. 현재는 비교용으로만 사용하며 최종 추천 점수에는 직접 반영하지 않습니다.")
 
     # 제외된 주요 후보와 제외 사유
     excluded_df = recommendation_df[
@@ -1355,30 +1357,73 @@ with tabs[1]:
         help="AI가 예측한 6개월 내 전세가 5%+ 하락 확률",
     )
 
-    if bool(candidate_row.get("HAS_RICHGO_SIGNAL", False)):
-        richgo_score = candidate_row.get("RICHGO_TOTAL_SCORE")
-        richgo_grade = candidate_row.get("RICHGO_GRADE")
-        richgo_jeonse_rate = candidate_row.get("RICHGO_JEONSE_RATE")
+    market_score = float(candidate_row.get("MARKET_SCORE", candidate_row.get("TOTAL_SCORE", 0)))
+    structural_score = pd.to_numeric(pd.Series([candidate_row.get("STRUCTURAL_SCORE")]), errors="coerce").iloc[0]
+    score_gap = pd.to_numeric(pd.Series([candidate_row.get("MARKET_STRUCTURE_GAP")]), errors="coerce").iloc[0]
 
-        rg_1, rg_2, rg_3 = st.columns(3)
-        rg_1.metric(
-            "리치고 구조 점수",
-            f"{float(richgo_score):.1f}" if pd.notna(richgo_score) else "-",
-            help="리치고 구조 신호 기준 보조 점수",
+    cmp_1, cmp_2, cmp_3 = st.columns(3)
+    cmp_1.metric(
+        "국토부 시장 점수",
+        f"{market_score:.1f}점",
+        help="국토부 실거래 기반 전세가율, 거래 활발도, 변동성으로 만든 시장 점수",
+    )
+    cmp_2.metric(
+        "구조 비교 점수",
+        f"{float(structural_score):.1f}점" if pd.notna(structural_score) else "-",
+        help="리치고 구조 신호와 SPH/Grandata 생활·재무 신호를 합친 구조 점수",
+    )
+    cmp_3.metric(
+        "점수 차이",
+        f"{abs(float(score_gap)):.1f}점" if pd.notna(score_gap) else "-",
+        delta=str(candidate_row.get("GAP_DIRECTION_LABEL", "비교 데이터 부족")),
+        delta_color="off",
+        help="구조 점수 - 시장 점수. 두 점수의 방향 차이를 보여줍니다.",
+    )
+
+    comparison_label = str(candidate_row.get("COMPARISON_LABEL", "구조 비교 데이터 부족"))
+    comparison_detail = str(candidate_row.get("COMPARISON_DETAIL", ""))
+    structure_data_label = str(candidate_row.get("STRUCTURE_DATA_LABEL", "비교 데이터 부족"))
+    st.markdown(
+        f'<div style="background:linear-gradient(135deg,#f9fbfd 0%,#eef4f7 100%);'
+        f'border:1px solid #d8e4ea;border-radius:14px;padding:1rem 1.2rem;margin-top:0.8rem">'
+        f'<div style="display:flex;align-items:center;justify-content:space-between;gap:0.8rem;flex-wrap:wrap">'
+        f'<div style="display:flex;align-items:center;gap:8px">'
+        f'{_icon("compare_arrows", 20, "#1565c0")}'
+        f'<span style="font-size:0.82rem;font-weight:700;color:#1565c0;letter-spacing:0.03em">시장 점수 vs 구조 점수</span>'
+        f'</div>'
+        f'<span style="background:#fff;border:1px solid #c7d8e5;color:#204b63;padding:4px 10px;border-radius:999px;font-size:0.76rem;font-weight:600">{comparison_label}</span>'
+        f'</div>'
+        f'<div style="margin-top:0.7rem;color:#24343f;font-size:0.92rem;line-height:1.7">{comparison_detail}</div>'
+        f'<div style="margin-top:0.55rem;color:#6a7a86;font-size:0.76rem">구조 비교 구성: {structure_data_label}</div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+    if bool(candidate_row.get("HAS_STRUCTURE_SIGNAL", False)):
+        comp_1, comp_2, comp_3, comp_4 = st.columns(4)
+        comp_1.metric(
+            "리치고 구조",
+            f"{float(candidate_row['RICHGO_STRUCTURE_SCORE']):.1f}점" if pd.notna(candidate_row.get("RICHGO_STRUCTURE_SCORE")) else "-",
+            help="리치고의 지하철 거리와 순이동 신호를 합친 구조 점수",
         )
-        rg_2.metric(
-            "리치고 등급",
-            f"{richgo_grade}" if pd.notna(richgo_grade) else "-",
-            help="리치고 구조 신호 기준 보조 등급",
+        comp_2.metric(
+            "SPH 활동",
+            f"{float(candidate_row['SPH_ACTIVITY_SCORE']):.1f}점" if pd.notna(candidate_row.get("SPH_ACTIVITY_SCORE")) else "-",
+            help="SPH/Grandata의 근무·방문·거주 인구 신호를 합친 점수",
         )
-        rg_3.metric(
-            "리치고 전세가율",
-            f"{float(richgo_jeonse_rate):.1f}%" if pd.notna(richgo_jeonse_rate) else "-",
-            help="리치고 가격 데이터 기준 전세가율",
+        comp_3.metric(
+            "SPH 재무",
+            f"{float(candidate_row['SPH_FINANCE_SCORE']):.1f}점" if pd.notna(candidate_row.get("SPH_FINANCE_SCORE")) else "-",
+            help="SPH/Grandata의 소득·자산 신호를 합친 점수",
         )
-        st.caption("리치고 구조 신호는 현재 진단 보조 지표로만 표시되며, 아직 최종 추천 점수에는 직접 반영되지 않습니다.")
+        comp_4.metric(
+            "시세 일치도",
+            f"{float(candidate_row['RATE_CONSISTENCY_SCORE']):.1f}점" if pd.notna(candidate_row.get("RATE_CONSISTENCY_SCORE")) else "-",
+            help="국토부 전세가율과 리치고 전세가율이 얼마나 비슷한지 보여주는 점수",
+        )
+        st.caption("구조 비교 점수는 리치고와 SPH/Grandata 신호를 재정규화해 만든 비교 지표입니다. 현재는 해석용으로만 사용하고, 최종 추천 점수에는 직접 반영하지 않습니다.")
     else:
-        st.caption("리치고 구조 신호가 연결되지 않은 지역입니다. 현재는 국토부 실거래 기반 진단만 표시합니다.")
+        st.caption("리치고/SPH 구조 신호가 부족해 현재 후보는 국토부 시장 점수 중심으로 진단하고 있습니다.")
 
     # ── AI 분석 (전체 너비, 총평이 메인) ──
     # 분석은 탭 렌더 전에 미리 호출되어 `analysis` 변수에 저장됨
